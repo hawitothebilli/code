@@ -1,0 +1,784 @@
+"""
+Solana On-Chain Wallet Tracker Bot
+===================================
+Tracks swaps, token transfers, and SOL transfers for any Solana wallet.
+Sends real-time alerts to your Telegram chat.
+
+Setup: See SETUP.md
+"""
+
+import asyncio
+import sqlite3
+import httpx
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+# ============================================================
+# CONFIG — Fill these in before running!
+# ============================================================
+HELIUS_API_KEY = "80fd0e53-c3ae-4ee0-b35a-d43dfb58f0b4"       # Get free at: https://helius.dev
+TELEGRAM_BOT_TOKEN = "8701624554:AAHpV1xlmaoHZ04GHY6jbCsXFpFHLmb67sA"  # Get from @BotFather on Telegram
+POLL_INTERVAL = 30  # Seconds between wallet checks (30 is a good default)
+
+# ── Transfer spam filter ──────────────────────────────────────
+# Incoming transfers with fewer recipients than this are likely dust/spam airdrops
+# (e.g. the odinbot sending tiny SOL to 20 wallets at once)
+MAX_TRANSFER_RECIPIENTS = 3   # skip tx if SOL was sent to more than this many accounts at once
+MIN_INCOMING_SOL = 0.05       # skip incoming SOL transfers smaller than this (SOL)
+# ─────────────────────────────────────────────────────────────
+# ============================================================
+
+
+# ─────────────────────────────────────────
+# DATABASE (SQLite — stores wallets + chats)
+# ─────────────────────────────────────────
+
+def init_db():
+    conn = sqlite3.connect("wallets.db")
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS wallets (
+            address TEXT PRIMARY KEY,
+            label TEXT,
+            last_signature TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS chats (
+            chat_id INTEGER PRIMARY KEY
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_wallets():
+    conn = sqlite3.connect("wallets.db")
+    c = conn.cursor()
+    c.execute("SELECT address, label, last_signature FROM wallets")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def add_wallet(address: str, label: str) -> bool:
+    conn = sqlite3.connect("wallets.db")
+    c = conn.cursor()
+    try:
+        c.execute(
+            "INSERT INTO wallets (address, label, last_signature) VALUES (?, ?, NULL)",
+            (address, label)
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+def remove_wallet(address: str) -> bool:
+    conn = sqlite3.connect("wallets.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM wallets WHERE address = ?", (address,))
+    affected = c.rowcount
+    conn.commit()
+    conn.close()
+    return affected > 0
+
+def update_last_signature(address: str, signature: str):
+    conn = sqlite3.connect("wallets.db")
+    c = conn.cursor()
+    c.execute("UPDATE wallets SET last_signature = ? WHERE address = ?", (signature, address))
+    conn.commit()
+    conn.close()
+
+def add_chat(chat_id: int):
+    conn = sqlite3.connect("wallets.db")
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO chats (chat_id) VALUES (?)", (chat_id,))
+    conn.commit()
+    conn.close()
+
+def get_chats():
+    conn = sqlite3.connect("wallets.db")
+    c = conn.cursor()
+    c.execute("SELECT chat_id FROM chats")
+    chats = [row[0] for row in c.fetchall()]
+    conn.close()
+    return chats
+
+
+# ─────────────────────────────────────────
+# HELIUS API (fetches on-chain transactions)
+# ─────────────────────────────────────────
+
+# Well-known token symbols (so we don't need an API call for these)
+KNOWN_TOKENS = {
+    "So11111111111111111111111111111111111111112":  "WSOL",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB":  "USDT",
+    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So":  "mSOL",
+    "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs":  "ETH",
+    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263":  "BONK",
+}
+
+# In-memory caches
+_symbol_cache: dict[str, str] = {}
+_mc_cache: dict[str, float] = {}      # mint → market cap USD
+
+async def get_token_symbol(mint: str) -> str:
+    """Resolve a mint address to a symbol. Uses cache + Helius DAS API."""
+    if not mint:
+        return "?"
+    if mint in KNOWN_TOKENS:
+        return KNOWN_TOKENS[mint]
+    if mint in _symbol_cache:
+        return _symbol_cache[mint]
+
+    # Ask Helius DAS for the asset metadata
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.post(
+                f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
+                json={"jsonrpc": "2.0", "id": "sym", "method": "getAsset",
+                      "params": {"id": mint}},
+            )
+            if resp.status_code == 200:
+                data = resp.json().get("result", {})
+                symbol = (
+                    data.get("content", {})
+                        .get("metadata", {})
+                        .get("symbol", "")
+                    or data.get("token_info", {}).get("symbol", "")
+                )
+                if symbol:
+                    _symbol_cache[mint] = symbol
+                    return symbol
+    except Exception:
+        pass
+
+    # Fallback: short address
+    sym = short(mint)
+    _symbol_cache[mint] = sym
+    return sym
+
+async def resolve_symbols(tx: dict) -> tuple[dict[str, str], dict[str, float]]:
+    """Pre-fetch symbols + USD prices for all mints in a transaction."""
+    SOL_MINT = "So11111111111111111111111111111111111111112"
+    mints = {SOL_MINT}  # always include SOL so we can price it
+    for xfer in tx.get("tokenTransfers", []):
+        if m := xfer.get("mint"):
+            mints.add(m)
+    swap = tx.get("events", {}).get("swap", {})
+    for t in swap.get("tokenInputs", []) + swap.get("tokenOutputs", []):
+        if m := t.get("mint"):
+            mints.add(m)
+
+    syms: dict[str, str] = {}
+    for mint in mints:
+        syms[mint] = await get_token_symbol(mint)
+
+    prices = await get_token_prices(list(mints))
+    return syms, prices
+
+async def get_token_prices(mints: list[str]) -> dict[str, float]:
+    """
+    Fetch USD prices for a list of mints.
+    Strategy:
+      1. Try Jupiter (good for major tokens, SOL, WSOL, USDC…)
+      2. For any mints still missing, try Dexscreener (covers pump.fun & new tokens)
+    """
+    if not mints:
+        return {}
+
+    unique = list(set(mints))
+    result: dict[str, float] = {}
+
+    # ── 1. Jupiter Price API ──────────────────────────────────
+    try:
+        ids = ",".join(unique)
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(f"https://api.jup.ag/price/v2?ids={ids}")
+            if resp.status_code == 200:
+                data = resp.json().get("data", {})
+                for mint, info in data.items():
+                    if info and info.get("price"):
+                        try:
+                            result[mint] = float(info["price"])
+                        except Exception:
+                            pass
+    except Exception as e:
+        print(f"[Jupiter] Price fetch failed: {e}")
+
+    # ── 2. Dexscreener fallback for anything Jupiter missed ───
+    missing = [m for m in unique if m not in result]
+    if missing:
+        try:
+            # Dexscreener accepts up to 30 comma-separated addresses
+            ids = ",".join(missing[:30])
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(
+                    f"https://api.dexscreener.com/latest/dex/tokens/{ids}"
+                )
+                if resp.status_code == 200:
+                    pairs = resp.json().get("pairs") or []
+                    # For each mint, pick the pair with highest liquidity
+                    best: dict[str, tuple[float, float, float]] = {}  # mint → (liq, price, mc)
+                    for pair in pairs:
+                        price_usd = pair.get("priceUsd")
+                        if not price_usd:
+                            continue
+                        liq = float(pair.get("liquidity", {}).get("usd", 0) or 0)
+                        mc  = float(pair.get("marketCap") or pair.get("fdv") or 0)
+                        mint = pair.get("baseToken", {}).get("address", "")
+                        if mint:
+                            if mint not in best or liq > best[mint][0]:
+                                best[mint] = (liq, float(price_usd), mc)
+                    for mint, (_, price, mc) in best.items():
+                        if mint not in result:
+                            result[mint] = price
+                        if mc:
+                            _mc_cache[mint] = mc
+        except Exception as e:
+            print(f"[Dexscreener] Price fetch failed: {e}")
+
+    print(f"[Prices] resolved {len(result)}/{len(unique)}: { {k[-6:]: round(v,6) for k,v in result.items()} }")
+    return result
+
+def fmt_usd(val: float) -> str:
+    if val >= 1_000_000: return f"${val/1_000_000:.2f}M"
+    if val >= 1_000:     return f"${val:,.0f}"
+    if val >= 0.01:      return f"${val:.2f}"
+    return f"${val:.6f}"
+
+async def get_wallet_token_balance(wallet: str, mint: str) -> float:
+    """Return the human-readable token balance for a wallet."""
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(
+                f"https://api.helius.xyz/v0/addresses/{wallet}/balances",
+                params={"api-key": HELIUS_API_KEY}
+            )
+            if resp.status_code == 200:
+                for tok in resp.json().get("tokens", []):
+                    if tok.get("mint") == mint:
+                        amt = float(tok.get("amount", 0))
+                        dec = int(tok.get("decimals", 0))
+                        return amt / (10 ** dec)
+    except Exception:
+        pass
+    return 0.0
+
+async def fetch_transactions(address: str, limit: int = 10):
+    """Fetch recent parsed transactions for a wallet from Helius."""
+    url = f"https://api.helius.xyz/v0/addresses/{address}/transactions"
+    params = {"api-key": HELIUS_API_KEY, "limit": limit}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, params=params)
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                print(f"[Helius] Error {resp.status_code} for {address[:8]}...")
+    except Exception as e:
+        print(f"[Helius] Request failed: {e}")
+    return []
+
+
+# ─────────────────────────────────────────
+# FORMATTERS (turn raw tx data into messages)
+# ─────────────────────────────────────────
+
+def short(addr: str) -> str:
+    """Shorten a wallet address: ABC...XYZ"""
+    return f"{addr[:6]}...{addr[-4:]}" if addr else "?"
+
+def format_amount(amount) -> str:
+    """Format a token amount with K/M/B suffixes."""
+    try:
+        n = float(amount)
+        if n >= 1_000_000_000:
+            return f"{n/1_000_000_000:.2f}B"
+        elif n >= 1_000_000:
+            return f"{n/1_000_000:.2f}M"
+        elif n >= 1_000:
+            return f"{n/1_000:.2f}K"
+        elif n >= 1:
+            return f"{n:.2f}"
+        else:
+            return f"{n:.6f}".rstrip("0").rstrip(".")
+    except:
+        return str(amount)
+
+def format_swap(tx: dict, label: str, address: str,
+                syms: dict = {}, prices: dict = {},
+                balance: float = 0.0) -> tuple:
+    """
+    Returns (text, reply_markup) matching the reference design.
+    """
+    SOL_MINT = "So11111111111111111111111111111111111111112"
+    events    = tx.get("events", {})
+    swap      = events.get("swap", {})
+    tok_xfers = tx.get("tokenTransfers", [])
+    nat_xfers = tx.get("nativeTransfers", [])
+    fee_sol   = tx.get("fee", 0) / 1e9
+
+    def sym_for(mint: str, fallback: str = "") -> str:
+        return syms.get(mint) or fallback or short(mint)
+
+    def usd_val(raw: float, mint: str) -> float:
+        return raw * prices.get(mint, 0)
+
+    def sol_usd(sol: float) -> float:
+        return sol * prices.get(SOL_MINT, 0)
+
+    # ── Resolve sent / received sides ──────────────────────────
+    inputs     = swap.get("tokenInputs", [])
+    outputs    = swap.get("tokenOutputs", [])
+    native_in  = swap.get("nativeInput")
+    native_out = swap.get("nativeOutput")
+
+    sol_sent = sol_got = 0.0
+    tok_sent_raw = tok_got_raw = 0.0
+    tok_sent_mint = tok_got_mint = ""
+    tok_sent_sym  = tok_got_sym  = ""
+
+    # Jupiter / Raydium path
+    if inputs:
+        t = inputs[0]
+        tok_sent_raw  = float(t.get("tokenAmount", 0))
+        tok_sent_mint = t.get("mint", "")
+        tok_sent_sym  = sym_for(tok_sent_mint, t.get("symbol", ""))
+    elif native_in:
+        sol_sent = float(native_in.get("amount", 0)) / 1e9
+
+    if outputs:
+        t = outputs[0]
+        tok_got_raw  = float(t.get("tokenAmount", 0))
+        tok_got_mint = t.get("mint", "")
+        tok_got_sym  = sym_for(tok_got_mint, t.get("symbol", ""))
+    elif native_out:
+        sol_got = float(native_out.get("amount", 0)) / 1e9
+
+    # Pump.fun fallback
+    if not any([tok_sent_raw, tok_got_raw, sol_sent, sol_got]):
+        t_out = [x for x in tok_xfers if x.get("fromUserAccount") == address]
+        t_in  = [x for x in tok_xfers if x.get("toUserAccount") == address]
+        if t_out:
+            best = max(t_out, key=lambda x: float(x.get("tokenAmount", 0)))
+            tok_sent_raw  = float(best.get("tokenAmount", 0))
+            tok_sent_mint = best.get("mint", "")
+            tok_sent_sym  = sym_for(tok_sent_mint, best.get("symbol", ""))
+        if t_in:
+            best = max(t_in, key=lambda x: float(x.get("tokenAmount", 0)))
+            tok_got_raw  = float(best.get("tokenAmount", 0))
+            tok_got_mint = best.get("mint", "")
+            tok_got_sym  = sym_for(tok_got_mint, best.get("symbol", ""))
+        n_out = [x for x in nat_xfers if x.get("fromUserAccount") == address
+                 and float(x.get("amount", 0)) / 1e9 > 0.001]
+        n_in  = [x for x in nat_xfers if x.get("toUserAccount") == address
+                 and float(x.get("amount", 0)) / 1e9 > 0.001]
+        if n_out and not tok_sent_raw:
+            sol_sent = float(max(n_out, key=lambda x: x.get("amount", 0))["amount"]) / 1e9
+        if n_in and not tok_got_raw:
+            sol_got  = float(max(n_in,  key=lambda x: x.get("amount", 0))["amount"]) / 1e9
+
+    # ── BUY or SELL? ───────────────────────────────────────────
+    # BUY  = wallet spent SOL / sent a base token, received the meme token
+    # SELL = wallet sent the meme token, received SOL
+    is_buy = bool(sol_sent or (tok_sent_mint == SOL_MINT)) or (
+             tok_got_raw > tok_sent_raw and tok_got_mint not in (SOL_MINT, ""))
+
+    # The "main" token (the non-SOL side)
+    if is_buy:
+        main_mint = tok_got_mint or tok_sent_mint
+        main_sym  = tok_got_sym  or tok_sent_sym
+        sol_amt   = sol_sent or (tok_sent_raw if tok_sent_mint == SOL_MINT else 0)
+        tok_amt   = tok_got_raw
+        tok_mint  = tok_got_mint
+    else:
+        main_mint = tok_sent_mint or tok_got_mint
+        main_sym  = tok_sent_sym  or tok_got_sym
+        sol_amt   = sol_got  or (tok_got_raw  if tok_got_mint  == SOL_MINT else 0)
+        tok_amt   = tok_sent_raw
+        tok_mint  = tok_sent_mint
+
+    action_emoji = "🟢" if is_buy else "🔴"
+    action_word  = "BUY"  if is_buy else "SELL"
+
+    # ── USD values ─────────────────────────────────────────────
+    sol_usd_val = sol_usd(sol_amt)
+    tok_usd_val = usd_val(tok_amt, tok_mint)
+    total_usd   = tok_usd_val or sol_usd_val
+
+    # Price per token
+    if tok_amt and sol_amt:
+        price_per = sol_amt / tok_amt * prices.get(SOL_MINT, 0) if prices.get(SOL_MINT) else 0
+    elif tok_amt and prices.get(tok_mint):
+        price_per = prices[tok_mint]
+    else:
+        price_per = 0
+
+    # ── Market cap ─────────────────────────────────────────────
+    mc = _mc_cache.get(main_mint, 0)
+    mc_str = f"MC: {fmt_usd(mc)} | " if mc else ""
+
+    # ── Format the swap line ───────────────────────────────────
+    sol_str   = f"<b>{sol_amt:.4f} SOL</b>" if sol_amt else ""
+    fee_str   = f"(+fee {fee_sol:.4f} SOL) " if fee_sol > 0.0001 else ""
+    tok_str   = f"<b>{format_amount(tok_amt)}</b>" if tok_amt else "<b>?</b>"
+    usd_str   = f"(<b>{fmt_usd(total_usd)}</b>) " if total_usd >= 0.01 else ""
+    price_str = f"@ <b>{fmt_usd(price_per)}</b>" if price_per else ""
+
+    if is_buy:
+        swap_line = (f"💎 {label} swapped {sol_str} {fee_str}"
+                     f"for {tok_str} {usd_str}{main_sym} {price_str}".strip())
+    else:
+        swap_line = (f"💎 {label} swapped {tok_str} {main_sym} {fee_str}"
+                     f"for {sol_str} {usd_str}{price_str}".strip())
+
+    # ── Holdings line (accumulated total) ─────────────────────
+    if balance > 0:
+        holds_str = f"🤚 Holds: <b>{format_amount(balance)} {main_sym}</b> total"
+    else:
+        holds_str = ""
+
+    # ── Source / DEX ───────────────────────────────────────────
+    source = tx.get("source", "DEX").replace("_", " ").title()
+    sig    = tx.get("signature", "")
+
+    # ── Assemble message ───────────────────────────────────────
+    lines = [
+        f"{action_emoji} <b>{action_word} {main_sym}</b> on {source}",
+        f"💎 <b>{label}</b>",
+        f"<code>{address}</code>",
+        "",
+        swap_line,
+    ]
+    if holds_str:
+        lines.append(holds_str)
+    lines += [
+        "",
+        f"🟡 <b>#{main_sym}</b> | {mc_str}",
+        f"<code>{main_mint}</code>",
+        "",
+        f'🔗 <a href="https://solscan.io/tx/{sig}">Solscan</a>',
+    ]
+
+    text = "\n".join(lines)
+
+    # ── Inline buttons ─────────────────────────────────────────
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"🦎 GMGN",   url=f"https://gmgn.ai/sol/token/{main_mint}"),
+        InlineKeyboardButton(f"⚡ Trojan",  url=f"https://t.me/solana_trojanbot?start=r-ref_{main_mint}"),
+        InlineKeyboardButton(f"🌸 Bloom",   url=f"https://t.me/BloomSolana_bot?start={main_mint}"),
+    ]])
+
+    return text, keyboard
+
+def format_transfer(tx: dict, label: str, address: str) -> str:
+    token_xfers = tx.get("tokenTransfers", [])
+    native_xfers = tx.get("nativeTransfers", [])
+    sig = tx.get("signature", "")
+
+    # ── Spam / dust filter ──────────────────────────────────────
+    # If many different accounts received SOL in one tx, it's a mass airdrop/spam
+    native_recipients = {x.get("toUserAccount") for x in native_xfers}
+    if len(native_recipients) > MAX_TRANSFER_RECIPIENTS:
+        return None  # skip — looks like a bot spray
+
+    # Skip incoming SOL transfers below the minimum threshold
+    incoming_sol = sum(
+        float(x.get("amount", 0)) / 1e9
+        for x in native_xfers
+        if x.get("toUserAccount") == address
+    )
+    outgoing_sol = sum(
+        float(x.get("amount", 0)) / 1e9
+        for x in native_xfers
+        if x.get("fromUserAccount") == address
+    )
+    # Only skip if it's purely incoming with no tokens and below threshold
+    if incoming_sol > 0 and outgoing_sol == 0 and not token_xfers:
+        if incoming_sol < MIN_INCOMING_SOL:
+            return None
+    # ────────────────────────────────────────────────────────────
+
+    lines = []
+
+    for xfer in token_xfers[:4]:
+        amount = format_amount(xfer.get("tokenAmount", 0))
+        symbol = xfer.get("symbol") or short(xfer.get("mint", ""))
+        frm = short(xfer.get("fromUserAccount", ""))
+        to = short(xfer.get("toUserAccount", ""))
+        direction = "📥 Received" if xfer.get("toUserAccount", "") == address else "📤 Sent"
+        lines.append(f"{direction} <b>{amount} {symbol}</b>  {frm} → {to}")
+
+    for xfer in native_xfers[:2]:
+        amount = float(xfer.get("amount", 0)) / 1e9
+        if amount < 0.0001:
+            continue
+        frm = short(xfer.get("fromUserAccount", ""))
+        to = short(xfer.get("toUserAccount", ""))
+        direction = "📥 Received" if xfer.get("toUserAccount", "") == address else "📤 Sent"
+        lines.append(f"{direction} <b>{amount:.4f} SOL</b>  {frm} → {to}")
+
+    if not lines:
+        return None  # Nothing worth alerting
+
+    body = "\n".join(lines)
+    return (
+        f"💸 <b>TRANSFER</b>\n"
+        f"👤 <b>{label}</b>  <code>{short(address)}</code>\n\n"
+        f"{body}\n\n"
+        f'🔗 <a href="https://solscan.io/tx/{sig}">View on Solscan</a>'
+    )
+
+def format_generic(tx: dict, label: str, address: str) -> str:
+    tx_type = tx.get("type", "UNKNOWN").replace("_", " ").title()
+    desc = tx.get("description", "")
+    sig = tx.get("signature", "")
+
+    msg = (
+        f"⚡ <b>{tx_type}</b>\n"
+        f"👤 <b>{label}</b>  <code>{short(address)}</code>\n"
+    )
+    if desc:
+        msg += f"\n{desc[:200]}\n"
+    msg += f'\n🔗 <a href="https://solscan.io/tx/{sig}">View on Solscan</a>'
+    return msg
+
+# Transaction types to alert on (add/remove as you like)
+ALERT_TYPES = {
+    "SWAP",
+    "TRANSFER",
+    "TOKEN_MINT",
+    "BURN",
+    "COMPRESSED_NFT_TRANSFER",
+    "NFT_SALE",
+    "NFT_MINT",
+    "STAKE_SOL",
+    "UNSTAKE_SOL",
+}
+
+async def format_transaction(tx: dict, label: str, address: str,
+                             syms: dict = {}, prices: dict = {}):
+    """
+    Route a transaction to the right formatter.
+    Returns (text, reply_markup) or None if not alertable.
+    """
+    tx_type = tx.get("type", "UNKNOWN")
+
+    if tx_type not in ALERT_TYPES:
+        return None
+
+    if tx_type == "SWAP":
+        # Determine which mint the wallet received (for balance lookup)
+        tok_xfers = tx.get("tokenTransfers", [])
+        received_mint = ""
+        for xfer in tok_xfers:
+            if xfer.get("toUserAccount") == address and xfer.get("mint"):
+                received_mint = xfer["mint"]
+                break
+        balance = 0.0
+        if received_mint:
+            balance = await get_wallet_token_balance(address, received_mint)
+        return format_swap(tx, label, address, syms, prices, balance)
+
+    text = format_transfer(tx, label, address) or format_generic(tx, label, address)
+    if text is None:
+        return None
+    return text, None   # no keyboard for non-swap alerts
+
+
+# ─────────────────────────────────────────
+# TRACKER LOOP
+# ─────────────────────────────────────────
+
+async def track_wallets(app: Application):
+    """Background loop: polls wallets and sends Telegram alerts on new activity."""
+    print("👁  Tracker started — polling every", POLL_INTERVAL, "seconds")
+    await asyncio.sleep(3)  # Let the bot fully start first
+
+    while True:
+        wallets = get_wallets()
+
+        for address, label, last_sig in wallets:
+            try:
+                txs = await fetch_transactions(address, limit=10)
+                if not txs:
+                    await asyncio.sleep(1)
+                    continue
+
+                # First time seeing this wallet — just save the cursor
+                if last_sig is None:
+                    update_last_signature(address, txs[0]["signature"])
+                    print(f"[Init] {label} — cursor set to {txs[0]['signature'][:12]}...")
+                    await asyncio.sleep(1)
+                    continue
+
+                # Find transactions newer than the last known one
+                new_txs = []
+                for tx in txs:
+                    if tx["signature"] == last_sig:
+                        break
+                    new_txs.append(tx)
+
+                if not new_txs:
+                    await asyncio.sleep(1)
+                    continue
+
+                # Update cursor to the newest tx
+                update_last_signature(address, new_txs[0]["signature"])
+                chats = get_chats()
+
+                # Alert for each new transaction (oldest first)
+                for tx in reversed(new_txs):
+                    # Resolve token symbols + USD prices before formatting
+                    syms, prices = await resolve_symbols(tx)
+                    result = await format_transaction(tx, label, address, syms, prices)
+                    if result is None:
+                        continue
+
+                    msg, keyboard = result
+
+                    for chat_id in chats:
+                        try:
+                            await app.bot.send_message(
+                                chat_id=chat_id,
+                                text=msg,
+                                parse_mode="HTML",
+                                disable_web_page_preview=True,
+                                reply_markup=keyboard,
+                            )
+                        except Exception as e:
+                            print(f"[Telegram] Failed to send to {chat_id}: {e}")
+
+                    await asyncio.sleep(0.3)  # slight delay between messages
+
+            except Exception as e:
+                print(f"[Tracker] Error on {label}: {e}")
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+# ─────────────────────────────────────────
+# BOT COMMANDS
+# ─────────────────────────────────────────
+
+HELP_TEXT = (
+    "👁 <b>Solana Wallet Tracker</b>\n\n"
+    "<b>Commands:</b>\n"
+    "/add <code>ADDRESS</code> <code>Label</code> — Start tracking a wallet\n"
+    "/remove <code>ADDRESS</code> — Stop tracking a wallet\n"
+    "/list — Show all tracked wallets\n"
+    "/help — Show this message\n\n"
+    "<i>Alerts for: swaps, transfers, mints, burns, NFT activity</i>"
+)
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    add_chat(update.effective_chat.id)
+    await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    add_chat(update.effective_chat.id)
+    args = context.args
+
+    if not args:
+        await update.message.reply_text(
+            "Usage: /add <code>WALLET_ADDRESS</code> <code>Label</code>\n"
+            "Example: /add So11...abc MyWhale",
+            parse_mode="HTML",
+        )
+        return
+
+    address = args[0].strip()
+    label = " ".join(args[1:]) if len(args) > 1 else short(address)
+
+    if not (32 <= len(address) <= 44):
+        await update.message.reply_text("❌ That doesn't look like a valid Solana address.")
+        return
+
+    if add_wallet(address, label):
+        await update.message.reply_text(
+            f"✅ Now tracking <b>{label}</b>\n<code>{address}</code>",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text("⚠️ That wallet is already being tracked.")
+
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /remove <code>WALLET_ADDRESS</code>", parse_mode="HTML")
+        return
+
+    address = context.args[0].strip()
+    if remove_wallet(address):
+        await update.message.reply_text(
+            f"🗑 Stopped tracking <code>{address}</code>", parse_mode="HTML"
+        )
+    else:
+        await update.message.reply_text("❌ Wallet not found. Use /list to see tracked wallets.")
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wallets = get_wallets()
+    if not wallets:
+        await update.message.reply_text(
+            "No wallets tracked yet.\nUse /add <code>ADDRESS</code> <code>Label</code> to add one.",
+            parse_mode="HTML",
+        )
+        return
+
+    lines = "\n".join(
+        f"• <b>{label}</b>\n  <code>{addr}</code>" for addr, label, _ in wallets
+    )
+    await update.message.reply_text(
+        f"👁 <b>Tracked Wallets ({len(wallets)})</b>\n\n{lines}",
+        parse_mode="HTML",
+    )
+
+
+# ─────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────
+
+async def main():
+    if HELIUS_API_KEY == "YOUR_HELIUS_API_KEY":
+        print("❌ Please set your HELIUS_API_KEY in bot.py before running.")
+        return
+    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
+        print("❌ Please set your TELEGRAM_BOT_TOKEN in bot.py before running.")
+        return
+
+    init_db()
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("remove", cmd_remove))
+    app.add_handler(CommandHandler("list", cmd_list))
+
+    print("🤖 Bot is running. Press Ctrl+C to stop.")
+
+    async with app:
+        await app.start()
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+        # Start the wallet tracker in the background
+        tracker = asyncio.create_task(track_wallets(app))
+
+        # Keep running until Ctrl+C
+        try:
+            await asyncio.Event().wait()
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        finally:
+            tracker.cancel()
+            await app.updater.stop()
+            await app.stop()
+
+if __name__ == "__main__":
+    asyncio.run(main())
