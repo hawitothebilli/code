@@ -602,7 +602,12 @@ def format_transfer(tx: dict, label: str, address: str) -> str:
 
     lines = []
 
-    for xfer in token_xfers[:4]:
+    # Only show transfers the tracked wallet is directly part of
+    wallet_token_xfers = [
+        x for x in token_xfers
+        if x.get("fromUserAccount") == address or x.get("toUserAccount") == address
+    ]
+    for xfer in wallet_token_xfers[:4]:
         amount = format_amount(xfer.get("tokenAmount", 0))
         symbol = xfer.get("symbol") or short(xfer.get("mint", ""))
         frm = short(xfer.get("fromUserAccount", ""))
@@ -610,7 +615,11 @@ def format_transfer(tx: dict, label: str, address: str) -> str:
         direction = "📥 Received" if xfer.get("toUserAccount", "") == address else "📤 Sent"
         lines.append(f"{direction} <b>{amount} {symbol}</b>  {frm} → {to}")
 
-    for xfer in native_xfers[:2]:
+    wallet_native_xfers = [
+        x for x in native_xfers
+        if x.get("fromUserAccount") == address or x.get("toUserAccount") == address
+    ]
+    for xfer in wallet_native_xfers[:2]:
         amount = float(xfer.get("amount", 0)) / 1e9
         if amount < 0.0001:
             continue
