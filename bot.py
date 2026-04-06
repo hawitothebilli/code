@@ -513,7 +513,9 @@ def format_swap(tx: dict, label: str, address: str,
     SOL_LINK = token_link("SOL", SOL_MINT)
     main_link = token_link(main_sym, main_mint)
 
-    in_usd_str  = f"USDC(<b>{fmt_usd(in_usd)}</b>)"   if in_usd  >= 0.01 else ""
+    USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    USDC_LINK = f'<a href="https://solscan.io/token/{USDC_MINT}">USDC</a>'
+    in_usd_str  = f"{USDC_LINK}(<b>{fmt_usd(in_usd)}</b>)"   if in_usd  >= 0.01 else ""
     out_usd_str = f"(<b>{fmt_usd(out_usd)}</b>)"  if out_usd >= 0.01 else ""
     fee_str     = f" [fee {fee_sol:.4f} {SOL_LINK}]"   if fee_sol > 0.0001 else ""
     tok_str     = f"<b>{format_amount(tok_amt)}</b>" if tok_amt else "<b>?</b>"
@@ -606,10 +608,12 @@ def format_transfer(tx: dict, label: str, address: str) -> str:
         for x in native_xfers
         if x.get("fromUserAccount") == address
     )
-    # Only skip if it's purely incoming with no tokens and below threshold
-    if incoming_sol > 0 and outgoing_sol == 0 and not token_xfers:
-        if incoming_sol < MIN_INCOMING_SOL:
-            return None
+    # Skip any dust/spam transfer where total SOL is tiny and no meaningful tokens
+    total_sol = incoming_sol + outgoing_sol
+    wallet_tokens = [x for x in token_xfers
+                     if x.get("fromUserAccount") == address or x.get("toUserAccount") == address]
+    if total_sol < MIN_INCOMING_SOL and not wallet_tokens:
+        return None
     # ────────────────────────────────────────────────────────────
 
     lines = []
@@ -705,8 +709,15 @@ async def format_transaction(tx: dict, label: str, address: str,
                 if xfer.get("fromUserAccount") == address and xfer.get("mint") and xfer["mint"] != SOL_MINT:
                     main_mint = xfer["mint"]
                     break
+        # Detect if it's a sell (wallet sent the token, not received)
+        is_sell = not any(
+            xfer.get("toUserAccount") == address and xfer.get("mint") and xfer["mint"] != SOL_MINT
+            for xfer in tok_xfers
+        )
         balance = 0.0
         if main_mint:
+            if is_sell:
+                await asyncio.sleep(2)  # let on-chain state settle before reading balance
             balance = await get_wallet_token_balance(address, main_mint)
         return format_swap(tx, label, address, syms, prices, balance)
 
