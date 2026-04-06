@@ -246,8 +246,14 @@ async def get_token_prices(mints: list[str]) -> dict[str, float]:
     except Exception as e:
         print(f"[Jupiter] Price fetch failed: {e}")
 
-    # ── 2. Dexscreener fallback for anything Jupiter missed ───
-    missing = [m for m in unique if m not in result]
+    # ── 2. Dexscreener: fill missing prices + always grab MC for non-stable tokens ───
+    _stable = {
+        "So11111111111111111111111111111111111111112",
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    }
+    # include any token that's missing price OR missing market cap data
+    missing = [m for m in unique if m not in result or (m not in _stable and m not in _mc_cache)]
     if missing:
         try:
             # Dexscreener accepts up to 30 comma-separated addresses
@@ -432,7 +438,8 @@ def format_swap(tx: dict, label: str, address: str,
                  and float(x.get("amount", 0)) / 1e9 > 0.001]
         n_in  = [x for x in nat_xfers if x.get("toUserAccount") == address
                  and float(x.get("amount", 0)) / 1e9 > 0.001]
-        if n_out and not tok_sent_raw:
+        # Always capture SOL even if there's also a token transfer (e.g. Pump AMM fee tokens)
+        if n_out:
             sol_sent = float(max(n_out, key=lambda x: x.get("amount", 0))["amount"]) / 1e9
         if n_in and not tok_got_raw:
             sol_got  = float(max(n_in,  key=lambda x: x.get("amount", 0))["amount"]) / 1e9
@@ -478,18 +485,21 @@ def format_swap(tx: dict, label: str, address: str,
     mc_str = f"MC: <b>{fmt_mc(mc)}</b> | " if mc else ""
 
     # ── Format the swap line ───────────────────────────────────
-    sol_str   = f"<b>{sol_amt:.4f} SOL</b>" if sol_amt else ""
-    fee_str   = f"(+fee {fee_sol:.4f} SOL) " if fee_sol > 0.0001 else ""
-    tok_str   = f"<b>{format_amount(tok_amt)}</b>" if tok_amt else "<b>?</b>"
-    usd_str   = f"(<b>{fmt_usd(total_usd)}</b>) " if total_usd >= 0.01 else ""
-    price_str = f"@ <b>{fmt_usd(price_per)}</b>" if price_per else ""
+    # Show USD values rather than raw SOL amounts
+    in_usd    = sol_usd_val or usd_val(tok_sent_raw, tok_sent_mint)
+    out_usd   = tok_usd_val
+    in_usd_str  = f"(<b>{fmt_usd(in_usd)}</b>)"   if in_usd  >= 0.01 else ""
+    out_usd_str = f"(<b>{fmt_usd(out_usd)}</b>)"  if out_usd >= 0.01 else ""
+    fee_str     = f" [fee {fee_sol:.4f} SOL]"      if fee_sol > 0.0001 else ""
+    tok_str     = f"<b>{format_amount(tok_amt)}</b>" if tok_amt else "<b>?</b>"
+    price_str   = f"@ <b>{fmt_usd(price_per)}</b>" if price_per else ""
 
     if is_buy:
-        swap_line = (f"💎 <b>{label}</b> swapped {sol_str} {fee_str}"
-                     f"for {tok_str} {usd_str}<b>{main_sym}</b> {price_str}".strip())
+        swap_line = (f"💎 <b>{label}</b> swapped {in_usd_str} for "
+                     f"{tok_str} <b>{main_sym}</b> {out_usd_str} {price_str}{fee_str}".strip())
     else:
-        swap_line = (f"💎 <b>{label}</b> swapped {tok_str} <b>{main_sym}</b> {fee_str}"
-                     f"for {sol_str} {usd_str}{price_str}".strip())
+        swap_line = (f"💎 <b>{label}</b> swapped {tok_str} <b>{main_sym}</b> {out_usd_str} for "
+                     f"{in_usd_str} {price_str}{fee_str}".strip())
 
     # ── Holdings line ──────────────────────────────────────────
     if balance > 0:
