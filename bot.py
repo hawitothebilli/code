@@ -781,39 +781,43 @@ async def format_transaction(tx: dict, label: str, address: str,
     if tx_type not in ALERT_TYPES:
         return None
 
-    if tx_type == "SWAP":
-        # Determine the main token mint (received on buy, sent on sell)
-        tok_xfers = tx.get("tokenTransfers", [])
-        SOL_MINT = "So11111111111111111111111111111111111111112"
+    # ── Detect if this tx has swap-like token activity ──────────
+    # Helius sometimes types swaps as "TRANSFER" — detect and route to swap formatter
+    tok_xfers = tx.get("tokenTransfers", [])
+    SOL_MINT = "So11111111111111111111111111111111111111112"
+    _BASE = {SOL_MINT, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+             "Es9vMFrzaCERmKfreVB8xSJux2KQ9pCUhZzQqau6t1Hn",
+             "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"}
+    wallet_tok_xfers = [x for x in tok_xfers
+                        if (x.get("fromUserAccount") == address or x.get("toUserAccount") == address)
+                        and x.get("mint") not in _BASE]
+    is_swap_like = tx_type == "SWAP" or (tx_type == "TRANSFER" and len(wallet_tok_xfers) > 0)
+
+    if is_swap_like:
         main_mint = ""
         # First try: token received by wallet (buy side)
         for xfer in tok_xfers:
-            if xfer.get("toUserAccount") == address and xfer.get("mint") and xfer["mint"] != SOL_MINT:
+            if xfer.get("toUserAccount") == address and xfer.get("mint") and xfer["mint"] not in _BASE:
                 main_mint = xfer["mint"]
                 break
         # Fallback: token sent by wallet (sell side)
         if not main_mint:
             for xfer in tok_xfers:
-                if xfer.get("fromUserAccount") == address and xfer.get("mint") and xfer["mint"] != SOL_MINT:
+                if xfer.get("fromUserAccount") == address and xfer.get("mint") and xfer["mint"] not in _BASE:
                     main_mint = xfer["mint"]
                     break
-        # Detect if it's a sell (wallet sent the token, not received)
-        is_sell = not any(
-            xfer.get("toUserAccount") == address and xfer.get("mint") and xfer["mint"] != SOL_MINT
-            for xfer in tok_xfers
-        )
+        if not main_mint:
+            # No non-base token found — skip entirely (USDC/SOL shuffle)
+            return None
         balance = 0.0
         if main_mint:
-            # Fetch token age if not cached
             if main_mint not in _created_cache:
                 await get_token_age(main_mint)
-            # Always read balance immediately (same as buys — RPC confirmed state)
             balance = await get_wallet_token_balance(address, main_mint)
         return format_swap(tx, label, address, syms, prices, balance)
 
     if tx_type == "TRANSFER":
         text = format_transfer(tx, label, address)
-        # If format_transfer returned None, it was filtered (swap/dust/spam) — don't fallback
         if text is None:
             return None
         return text, None
