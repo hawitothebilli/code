@@ -885,6 +885,15 @@ async def format_transaction(tx: dict, label: str, address: str,
     if tx_type not in ALERT_TYPES:
         return None
 
+    # Skip transactions involving 0x (Ethereum) addresses
+    desc = tx.get("description", "")
+    if "0x" in desc:
+        return None
+    for xfer in tx.get("tokenTransfers", []):
+        mint = xfer.get("mint", "")
+        if mint.startswith("0x"):
+            return None
+
     # ── Detect if this tx has swap-like token activity ──────────
     # Helius sometimes types swaps as "TRANSFER" — detect and route to swap formatter
     tok_xfers = tx.get("tokenTransfers", [])
@@ -1221,7 +1230,7 @@ async def add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         address = parts[0].strip()
         label = parts[1].strip() if len(parts) > 1 else short(address)
 
-        if not (32 <= len(address) <= 44):
+        if address.startswith("0x") or not (32 <= len(address) <= 44):
             errors.append(f"❌ Invalid: <code>{address[:20]}...</code>")
             continue
 
