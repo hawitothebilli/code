@@ -270,31 +270,25 @@ async def get_token_prices(mints: list[str]) -> dict[str, float]:
                 if resp.status_code == 200:
                     pairs = resp.json().get("pairs") or []
                     # For each mint, pick the pair with highest liquidity
+                    # Dexscreener priceUsd / marketCap always refer to the BASE token
+                    # only assign price+mc to baseToken, never quoteToken
                     best: dict[str, tuple[float, float, float]] = {}  # mint → (liq, price, mc)
-                    oldest: dict[str, int] = {}  # mint → oldest pairCreatedAt
                     for pair in pairs:
                         price_usd = pair.get("priceUsd")
                         if not price_usd:
                             continue
                         liq = float(pair.get("liquidity", {}).get("usd", 0) or 0)
                         mc  = float(pair.get("marketCap") or pair.get("fdv") or 0)
-                        created = int(pair.get("pairCreatedAt") or 0)
                         base_addr = pair.get("baseToken", {}).get("address", "")
-                        quote_addr = pair.get("quoteToken", {}).get("address", "")
-                        # Match the mint we're looking for (could be base or quote)
-                        for mint in (base_addr, quote_addr):
-                            if mint and mint in unique:
-                                if mint not in best or liq > best[mint][0]:
-                                    best[mint] = (liq, float(price_usd), mc)
-                                if created and (mint not in oldest or created < oldest[mint]):
-                                    oldest[mint] = created
+                        if base_addr and base_addr in unique:
+                            if base_addr not in best or liq > best[base_addr][0]:
+                                best[base_addr] = (liq, float(price_usd), mc)
                     for mint, (_, price, mc) in best.items():
                         if mint not in result:
                             result[mint] = price
                         if mc:
                             _mc_cache[mint] = mc
                     # Don't write _created_cache here — let get_token_age() handle it
-                    # (it picks the true oldest pair more reliably)
         except Exception as e:
             print(f"[Dexscreener] Price fetch failed: {e}")
 
@@ -305,6 +299,21 @@ def fmt_usd(val: float) -> str:
     if val >= 1_000_000: return f"${val/1_000_000:.2f}M"
     if val >= 1_000:     return f"${val:,.0f}"
     if val >= 0.01:      return f"${val:.2f}"
+    if val == 0:         return "$0"
+    # Subscript zeros: $0.0₅8 means 0.000008
+    s = f"{val:.15f}".rstrip("0")
+    # Count zeros after "0."
+    after_dot = s.split(".")[1] if "." in s else ""
+    zeros = 0
+    for ch in after_dot:
+        if ch == "0":
+            zeros += 1
+        else:
+            break
+    sig_digits = after_dot[zeros:][:2]  # first 2 significant digits
+    if zeros >= 3:
+        subscript = "".join(chr(0x2080 + int(d)) for d in str(zeros))
+        return f"$0.0{subscript}{sig_digits}"
     return f"${val:.6f}"
 
 def fmt_age(created_ms: int) -> str:
@@ -588,11 +597,18 @@ def format_swap(tx: dict, label: str, address: str,
 
     USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
     USDC_LINK = token_link("USDC", USDC_MINT)
-    # SOL swap: "0.0707 SOL ($5.78)"  |  USDC swap: "11.59 USDC ($11.59)"
+    # SOL swap: "0.1015 SOL ($8.36)"  |  USDC swap: "11.59 USDC ($11.59)"
+    # Token-to-token: convert to SOL equivalent
     if sol_amt and in_usd >= 0.01:
         in_usd_str = f"<b>{sol_amt:.4f}</b> {SOL_LINK} (<b>{fmt_usd(in_usd)}</b>)"
     elif in_usd >= 0.01:
-        in_usd_str = f"<b>{in_usd:.2f}</b> {USDC_LINK} (<b>{fmt_usd(in_usd)}</b>)"
+        sol_price = prices.get(SOL_MINT, 0)
+        if sol_price and tok_sent_mint and tok_sent_mint not in (SOL_MINT, USDC_MINT):
+            # Token-to-token swap — show SOL equivalent
+            sol_equiv = in_usd / sol_price
+            in_usd_str = f"<b>{sol_equiv:.4f}</b> {SOL_LINK} (<b>{fmt_usd(in_usd)}</b>)"
+        else:
+            in_usd_str = f"<b>{in_usd:.2f}</b> {USDC_LINK} (<b>{fmt_usd(in_usd)}</b>)"
     else:
         in_usd_str = ""
     out_usd_str = f"(<b>{fmt_usd(out_usd)}</b>)"  if out_usd >= 0.01 else ""
