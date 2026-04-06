@@ -560,8 +560,19 @@ def format_swap(tx: dict, label: str, address: str,
     if main_mint in _BASE_MINTS:
         return None  # not a meme/token trade, skip
 
-    action_emoji = "🟢" if is_buy else "🔴"
-    action_word  = "BUY"  if is_buy else "SELL"
+    # Detect token-to-token swap (neither side is SOL/USDC/USDT/mSOL)
+    is_token_swap = (tok_sent_mint and tok_sent_mint not in _BASE_MINTS
+                     and tok_got_mint and tok_got_mint not in _BASE_MINTS)
+
+    if is_token_swap:
+        action_emoji = "🔄"
+        action_word  = "SWAP"
+    elif is_buy:
+        action_emoji = "🟢"
+        action_word  = "BUY"
+    else:
+        action_emoji = "🔴"
+        action_word  = "SELL"
 
     # ── USD values ─────────────────────────────────────────────
     sol_usd_val = sol_usd(sol_amt)
@@ -651,8 +662,14 @@ def format_swap(tx: dict, label: str, address: str,
     sig    = tx.get("signature", "")
 
     # ── Assemble message ───────────────────────────────────────
+    if is_token_swap:
+        sent_link = token_link(tok_sent_sym, tok_sent_mint)
+        got_link  = token_link(tok_got_sym, tok_got_mint)
+        title_line = f"{action_emoji} <b>{action_word}</b> {sent_link}→{got_link} on {source}"
+    else:
+        title_line = f"{action_emoji} <b>{action_word}</b> {main_link} on {source}"
     lines = [
-        f"{action_emoji} <b>{action_word}</b> {main_link} on {source}",
+        title_line,
         f"💎 <b>{label}</b>",
         f"<code>{address}</code>",
         "",
