@@ -351,19 +351,12 @@ async def get_token_age(mint: str) -> int:
                     created = int(best.get("pairCreatedAt") or 0)
                     if created:
                         _created_cache[mint] = created
-                    # Also cache MC — use pair where mint is baseToken
-                    base_pairs = [p for p in pairs
-                                  if p.get("baseToken", {}).get("address") == mint]
-                    if base_pairs:
-                        bp = max(base_pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
-                        mc = float(bp.get("marketCap") or bp.get("fdv") or 0)
-                        if mc:
-                            _mc_cache[mint] = mc
-                    elif pairs:
-                        # Token is always quoteToken — use fdv if available
-                        mc = float(best.get("fdv") or 0)
-                        if mc:
-                            _mc_cache[mint] = mc
+                    # MC: Dexscreener marketCap/fdv is for the baseToken.
+                    # When querying by our mint, it's almost always the base.
+                    # Use marketCap first, then fdv, from highest-liq pair.
+                    mc = float(best.get("marketCap") or best.get("fdv") or 0)
+                    if mc and mint not in _mc_cache:
+                        _mc_cache[mint] = mc
                     return created
     except Exception:
         pass
@@ -623,30 +616,42 @@ def format_swap(tx: dict, label: str, address: str,
     USDC_LINK = token_link("USDC", USDC_MINT)
     USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
     _STABLE_MINTS = {SOL_MINT, USDC_MINT, USDT_MINT, "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"}
-    # SOL swap: "0.1015 SOL ($8.36)"  |  USDC swap: "11.59 USDC ($11.59)"
-    # Token-to-token: show actual input token with amount
-    if sol_amt and in_usd >= 0.01:
-        in_usd_str = f"<b>{sol_amt:.4f}</b> {SOL_LINK} (<b>{fmt_usd(in_usd)}</b>)"
-    elif in_usd >= 0.01:
-        if tok_sent_mint and tok_sent_mint not in _STABLE_MINTS:
-            # Token-to-token swap — show actual input token (e.g. "50,000 CAPY ($11.58)")
-            sent_link = token_link(tok_sent_sym, tok_sent_mint)
-            in_usd_str = f"<b>{format_amount(tok_sent_raw)}</b> {sent_link} (<b>{fmt_usd(in_usd)}</b>)"
-        else:
-            in_usd_str = f"<b>{in_usd:.2f}</b> {USDC_LINK} (<b>{fmt_usd(in_usd)}</b>)"
-    else:
-        in_usd_str = ""
-    out_usd_str = f"(<b>{fmt_usd(out_usd)}</b>)"  if out_usd >= 0.01 else ""
-    fee_str     = f" [fee {fee_sol:.4f} {SOL_LINK}]"   if fee_sol > 0.0001 else ""
-    tok_str     = f"<b>{format_amount(tok_amt)}</b>" if tok_amt else "<b>?</b>"
-    price_str   = f"@ {fmt_usd(price_per)}" if price_per else ""
+
+    def fmt_other_side(sol_amount, usd_value, other_mint, other_sym, other_raw):
+        """Format the non-main-token side (SOL, USDC, or another token)."""
+        if sol_amount and usd_value >= 0.01:
+            return f"<b>{sol_amount:.4f}</b> {SOL_LINK} (<b>{fmt_usd(usd_value)}</b>)"
+        if usd_value >= 0.01:
+            if other_mint and other_mint not in _STABLE_MINTS:
+                olink = token_link(other_sym, other_mint)
+                return f"<b>{format_amount(other_raw)}</b> {olink} (<b>{fmt_usd(usd_value)}</b>)"
+            if other_mint == USDC_MINT or (not other_mint and not sol_amount):
+                return f"<b>{usd_value:.2f}</b> {USDC_LINK} (<b>{fmt_usd(usd_value)}</b>)"
+            return f"(<b>{fmt_usd(usd_value)}</b>)"
+        return ""
+
+    fee_str   = f" [fee {fee_sol:.4f} {SOL_LINK}]" if fee_sol > 0.0001 else ""
+    tok_str   = f"<b>{format_amount(tok_amt)}</b>" if tok_amt else "<b>?</b>"
+    price_str = f"@ {fmt_usd(price_per)}" if price_per else ""
 
     if is_buy:
-        swap_line = (f"💎 <b>{label}</b> swapped {in_usd_str} for "
-                     f"{tok_str} {main_link} {out_usd_str} {price_str}{fee_str}".strip())
+        # BUY: "swapped [spent side] for [token received] ($value)"
+        spent_usd = sol_usd_val or usd_val(tok_sent_raw, tok_sent_mint)
+        spent_str = fmt_other_side(sol_amt, spent_usd, tok_sent_mint, tok_sent_sym, tok_sent_raw)
+        got_usd_str = f"(<b>{fmt_usd(tok_usd_val)}</b>)" if tok_usd_val >= 0.01 else ""
+        swap_line = (f"💎 <b>{label}</b> swapped {spent_str} for "
+                     f"{tok_str} {main_link} {got_usd_str} {price_str}{fee_str}".strip())
     else:
-        swap_line = (f"💎 <b>{label}</b> swapped {tok_str} {main_link} {out_usd_str} for "
-                     f"{in_usd_str} {price_str}{fee_str}".strip())
+        # SELL: "swapped [token sent] ($value) for [received side]"
+        sent_usd_str = f"(<b>{fmt_usd(tok_usd_val)}</b>)" if tok_usd_val >= 0.01 else ""
+        # What we received: SOL or USDC or another token
+        recv_sol = sol_got
+        recv_usd = sol_usd(sol_got) if sol_got else usd_val(tok_got_raw, tok_got_mint)
+        recv_str = fmt_other_side(recv_sol, recv_usd, tok_got_mint, tok_got_sym, tok_got_raw)
+        if not recv_str and total_usd >= 0.01:
+            recv_str = f"(<b>{fmt_usd(total_usd)}</b>)"
+        swap_line = (f"💎 <b>{label}</b> swapped {tok_str} {main_link} {sent_usd_str} for "
+                     f"{recv_str} {price_str}{fee_str}".strip())
 
     # ── Holdings line ──────────────────────────────────────────
     if balance > 0:
