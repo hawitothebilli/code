@@ -504,7 +504,7 @@ def format_swap(tx: dict, label: str, address: str,
     # Show USD values rather than raw SOL amounts
     in_usd    = sol_usd_val or usd_val(tok_sent_raw, tok_sent_mint)
     out_usd   = tok_usd_val
-    in_usd_str  = f"(<b>{fmt_usd(in_usd)}</b>)"   if in_usd  >= 0.01 else ""
+    in_usd_str  = f"USDC(<b>{fmt_usd(in_usd)}</b>)"   if in_usd  >= 0.01 else ""
     out_usd_str = f"(<b>{fmt_usd(out_usd)}</b>)"  if out_usd >= 0.01 else ""
     fee_str     = f" [fee {fee_sol:.4f} SOL]"      if fee_sol > 0.0001 else ""
     tok_str     = f"<b>{format_amount(tok_amt)}</b>" if tok_amt else "<b>?</b>"
