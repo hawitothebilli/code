@@ -161,6 +161,7 @@ KNOWN_TOKENS = {
 # In-memory caches
 _symbol_cache: dict[str, str] = {}
 _mc_cache: dict[str, float] = {}      # mint → market cap USD
+_created_cache: dict[str, int] = {}   # mint → pair created timestamp (ms)
 
 async def get_token_symbol(mint: str) -> str:
     """Resolve a mint address to a symbol. Uses cache + Helius DAS API."""
@@ -265,22 +266,25 @@ async def get_token_prices(mints: list[str]) -> dict[str, float]:
                 if resp.status_code == 200:
                     pairs = resp.json().get("pairs") or []
                     # For each mint, pick the pair with highest liquidity
-                    best: dict[str, tuple[float, float, float]] = {}  # mint → (liq, price, mc)
+                    best: dict[str, tuple[float, float, float, int]] = {}  # mint → (liq, price, mc, created)
                     for pair in pairs:
                         price_usd = pair.get("priceUsd")
                         if not price_usd:
                             continue
                         liq = float(pair.get("liquidity", {}).get("usd", 0) or 0)
                         mc  = float(pair.get("marketCap") or pair.get("fdv") or 0)
+                        created = int(pair.get("pairCreatedAt") or 0)
                         mint = pair.get("baseToken", {}).get("address", "")
                         if mint:
                             if mint not in best or liq > best[mint][0]:
-                                best[mint] = (liq, float(price_usd), mc)
-                    for mint, (_, price, mc) in best.items():
+                                best[mint] = (liq, float(price_usd), mc, created)
+                    for mint, (_, price, mc, created) in best.items():
                         if mint not in result:
                             result[mint] = price
                         if mc:
                             _mc_cache[mint] = mc
+                        if created:
+                            _created_cache[mint] = created
         except Exception as e:
             print(f"[Dexscreener] Price fetch failed: {e}")
 
@@ -292,6 +296,22 @@ def fmt_usd(val: float) -> str:
     if val >= 1_000:     return f"${val:,.0f}"
     if val >= 0.01:      return f"${val:.2f}"
     return f"${val:.6f}"
+
+def fmt_age(created_ms: int) -> str:
+    """Format token age as '5m', '3h', '2d' etc."""
+    import time
+    if not created_ms:
+        return ""
+    elapsed = int(time.time()) - (created_ms // 1000)
+    if elapsed < 0:
+        return ""
+    if elapsed < 60:
+        return f"{elapsed}s"
+    if elapsed < 3600:
+        return f"{elapsed // 60}m"
+    if elapsed < 86400:
+        return f"{elapsed // 3600}h"
+    return f"{elapsed // 86400}d"
 
 async def get_wallet_token_balance(wallet: str, mint: str) -> float:
     """
@@ -506,9 +526,11 @@ def format_swap(tx: dict, label: str, address: str,
     else:
         price_per = 0
 
-    # ── Market cap ─────────────────────────────────────────────
+    # ── Market cap + token age ────────────────────────────────
     mc = _mc_cache.get(main_mint, 0)
     mc_str = f"MC: <b>{fmt_mc(mc)}</b> | " if mc else ""
+    created_ts = _created_cache.get(main_mint, 0)
+    age_str = f"Seen: <b>{fmt_age(created_ts)}</b> | " if created_ts else ""
 
     # ── Format the swap line ───────────────────────────────────
     # Show USD values rather than raw SOL amounts
@@ -584,8 +606,8 @@ def format_swap(tx: dict, label: str, address: str,
         lines.append(pnl_str)
     lines += [
         "",
-        f"🟡 <b>#{main_sym}</b> | {mc_str}"
-        + (f'<a href="https://dexscreener.com/solana/{main_mint}">DexS</a>' if main_mint else ""),
+        f"🟡 <b>#{main_sym}</b> | {mc_str}{age_str}"
+        + (f'<a href="https://dexscreener.com/solana/{main_mint}">DexS</a> · <a href="https://gmgn.ai/sol/token/{main_mint}">GMGN</a>' if main_mint else ""),
         f"<code>{main_mint}</code>",
         "",
         f'🔗 <a href="https://solscan.io/tx/{sig}">Solscan</a>',
