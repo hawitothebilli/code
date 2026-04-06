@@ -10,14 +10,24 @@ Setup: See SETUP.md
 import asyncio
 import sqlite3
 import httpx
+import logging
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+logging.basicConfig(
+    filename="bot.log",
+    level=logging.INFO,
+    format="%(asctime)s %(message)s"
+)
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ============================================================
-# CONFIG — Fill these in before running!
+# CONFIG — keys are loaded from .env (never commit .env to git)
 # ============================================================
-HELIUS_API_KEY = "80fd0e53-c3ae-4ee0-b35a-d43dfb58f0b4"       # Get free at: https://helius.dev
-TELEGRAM_BOT_TOKEN = "8701624554:AAHpV1xlmaoHZ04GHY6jbCsXFpFHLmb67sA"  # Get from @BotFather on Telegram
+HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 POLL_INTERVAL = 30  # Seconds between wallet checks (30 is a good default)
 
 # ── Transfer spam filter ──────────────────────────────────────
@@ -48,6 +58,34 @@ def init_db():
             chat_id INTEGER PRIMARY KEY
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS first_buys (
+            wallet  TEXT,
+            mint    TEXT,
+            price   REAL,
+            ts      INTEGER,
+            PRIMARY KEY (wallet, mint)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_first_buy(wallet: str, mint: str):
+    """Returns (price, ts) of first recorded buy, or None."""
+    conn = sqlite3.connect("wallets.db")
+    c = conn.cursor()
+    c.execute("SELECT price, ts FROM first_buys WHERE wallet=? AND mint=?", (wallet, mint))
+    row = c.fetchone()
+    conn.close()
+    return row  # (price, ts) or None
+
+def save_first_buy(wallet: str, mint: str, price: float):
+    """Store the first detected buy price for a wallet+mint pair."""
+    import time
+    conn = sqlite3.connect("wallets.db")
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO first_buys (wallet, mint, price, ts) VALUES (?,?,?,?)",
+              (wallet, mint, price, int(time.time())))
     conn.commit()
     conn.close()
 
@@ -250,21 +288,37 @@ def fmt_usd(val: float) -> str:
     return f"${val:.6f}"
 
 async def get_wallet_token_balance(wallet: str, mint: str) -> float:
-    """Return the human-readable token balance for a wallet."""
+    """
+    Fetch token balance via Solana RPC getTokenAccountsByOwner.
+    More reliable and up-to-date than the Helius REST balances endpoint.
+    """
     try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            resp = await client.get(
-                f"https://api.helius.xyz/v0/addresses/{wallet}/balances",
-                params={"api-key": HELIUS_API_KEY}
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
+                json={
+                    "jsonrpc": "2.0", "id": "bal",
+                    "method": "getTokenAccountsByOwner",
+                    "params": [
+                        wallet,
+                        {"mint": mint},
+                        {"encoding": "jsonParsed"}
+                    ]
+                }
             )
             if resp.status_code == 200:
-                for tok in resp.json().get("tokens", []):
-                    if tok.get("mint") == mint:
-                        amt = float(tok.get("amount", 0))
-                        dec = int(tok.get("decimals", 0))
-                        return amt / (10 ** dec)
-    except Exception:
-        pass
+                accounts = resp.json().get("result", {}).get("value", [])
+                total = 0.0
+                for acc in accounts:
+                    info = (acc.get("account", {})
+                               .get("data", {})
+                               .get("parsed", {})
+                               .get("info", {}))
+                    ui_amount = info.get("tokenAmount", {}).get("uiAmount") or 0
+                    total += float(ui_amount)
+                return total
+    except Exception as e:
+        print(f"[RPC] Balance error: {e}")
     return 0.0
 
 async def fetch_transactions(address: str, limit: int = 10):
@@ -292,21 +346,23 @@ def short(addr: str) -> str:
     return f"{addr[:6]}...{addr[-4:]}" if addr else "?"
 
 def format_amount(amount) -> str:
-    """Format a token amount with K/M/B suffixes."""
+    """Full comma-separated token amount (e.g. 5,908,396.81)."""
     try:
         n = float(amount)
-        if n >= 1_000_000_000:
-            return f"{n/1_000_000_000:.2f}B"
-        elif n >= 1_000_000:
-            return f"{n/1_000_000:.2f}M"
-        elif n >= 1_000:
-            return f"{n/1_000:.2f}K"
-        elif n >= 1:
-            return f"{n:.2f}"
+        if n >= 1:
+            return f"{n:,.2f}"
         else:
             return f"{n:.6f}".rstrip("0").rstrip(".")
     except:
         return str(amount)
+
+def fmt_mc(val: float) -> str:
+    """Short K/M format for market cap (e.g. $23.92K, $1.24M)."""
+    if val >= 1_000_000_000: return f"${val/1_000_000_000:.2f}B"
+    if val >= 1_000_000:     return f"${val/1_000_000:.2f}M"
+    if val >= 1_000:         return f"${val/1_000:.2f}K"
+    if val >= 0.01:          return f"${val:.2f}"
+    return f"${val:.6f}"
 
 def format_swap(tx: dict, label: str, address: str,
                 syms: dict = {}, prices: dict = {},
@@ -419,7 +475,7 @@ def format_swap(tx: dict, label: str, address: str,
 
     # ── Market cap ─────────────────────────────────────────────
     mc = _mc_cache.get(main_mint, 0)
-    mc_str = f"MC: {fmt_usd(mc)} | " if mc else ""
+    mc_str = f"MC: <b>{fmt_mc(mc)}</b> | " if mc else ""
 
     # ── Format the swap line ───────────────────────────────────
     sol_str   = f"<b>{sol_amt:.4f} SOL</b>" if sol_amt else ""
@@ -429,17 +485,31 @@ def format_swap(tx: dict, label: str, address: str,
     price_str = f"@ <b>{fmt_usd(price_per)}</b>" if price_per else ""
 
     if is_buy:
-        swap_line = (f"💎 {label} swapped {sol_str} {fee_str}"
-                     f"for {tok_str} {usd_str}{main_sym} {price_str}".strip())
+        swap_line = (f"💎 <b>{label}</b> swapped {sol_str} {fee_str}"
+                     f"for {tok_str} {usd_str}<b>{main_sym}</b> {price_str}".strip())
     else:
-        swap_line = (f"💎 {label} swapped {tok_str} {main_sym} {fee_str}"
+        swap_line = (f"💎 <b>{label}</b> swapped {tok_str} <b>{main_sym}</b> {fee_str}"
                      f"for {sol_str} {usd_str}{price_str}".strip())
 
-    # ── Holdings line (accumulated total) ─────────────────────
+    # ── Holdings line ──────────────────────────────────────────
     if balance > 0:
         holds_str = f"🤚 Holds: <b>{format_amount(balance)} {main_sym}</b> total"
     else:
         holds_str = ""
+
+    # ── PnL vs first detected buy ──────────────────────────────
+    pnl_str = ""
+    if is_buy and price_per and main_mint:
+        first = get_first_buy(address, main_mint)
+        if first is None:
+            save_first_buy(address, main_mint, price_per)
+        else:
+            entry_price = first[0]
+            if entry_price and entry_price > 0:
+                pct = (price_per - entry_price) / entry_price * 100
+                sign = "+" if pct >= 0 else ""
+                emoji = "📈" if pct >= 0 else "📉"
+                pnl_str = f"{emoji} PnL vs entry: <b>{sign}{pct:.1f}%</b>"
 
     # ── Source / DEX ───────────────────────────────────────────
     source = tx.get("source", "DEX").replace("_", " ").title()
@@ -455,6 +525,8 @@ def format_swap(tx: dict, label: str, address: str,
     ]
     if holds_str:
         lines.append(holds_str)
+    if pnl_str:
+        lines.append(pnl_str)
     lines += [
         "",
         f"🟡 <b>#{main_sym}</b> | {mc_str}",
