@@ -510,11 +510,14 @@ def format_swap(tx: dict, label: str, address: str,
     tok_str     = f"<b>{format_amount(tok_amt)}</b>" if tok_amt else "<b>?</b>"
     price_str   = f"@ <b>{fmt_usd(price_per)}</b>" if price_per else ""
 
+    # Clickable token name → links to Solscan token page
+    sym_link = f'<a href="https://solscan.io/token/{main_mint}"><b>{main_sym}</b></a>' if main_mint else f"<b>{main_sym}</b>"
+
     if is_buy:
         swap_line = (f"💎 <b>{label}</b> swapped {in_usd_str} for "
-                     f"{tok_str} <b>{main_sym}</b> {out_usd_str} {price_str}{fee_str}".strip())
+                     f"{tok_str} {sym_link} {out_usd_str} {price_str}{fee_str}".strip())
     else:
-        swap_line = (f"💎 <b>{label}</b> swapped {tok_str} <b>{main_sym}</b> {out_usd_str} for "
+        swap_line = (f"💎 <b>{label}</b> swapped {tok_str} {sym_link} {out_usd_str} for "
                      f"{in_usd_str} {price_str}{fee_str}".strip())
 
     # ── Holdings line ──────────────────────────────────────────
@@ -678,16 +681,24 @@ async def format_transaction(tx: dict, label: str, address: str,
         return None
 
     if tx_type == "SWAP":
-        # Determine which mint the wallet received (for balance lookup)
+        # Determine the main token mint (received on buy, sent on sell)
         tok_xfers = tx.get("tokenTransfers", [])
-        received_mint = ""
+        SOL_MINT = "So11111111111111111111111111111111111111112"
+        main_mint = ""
+        # First try: token received by wallet (buy side)
         for xfer in tok_xfers:
-            if xfer.get("toUserAccount") == address and xfer.get("mint"):
-                received_mint = xfer["mint"]
+            if xfer.get("toUserAccount") == address and xfer.get("mint") and xfer["mint"] != SOL_MINT:
+                main_mint = xfer["mint"]
                 break
+        # Fallback: token sent by wallet (sell side)
+        if not main_mint:
+            for xfer in tok_xfers:
+                if xfer.get("fromUserAccount") == address and xfer.get("mint") and xfer["mint"] != SOL_MINT:
+                    main_mint = xfer["mint"]
+                    break
         balance = 0.0
-        if received_mint:
-            balance = await get_wallet_token_balance(address, received_mint)
+        if main_mint:
+            balance = await get_wallet_token_balance(address, main_mint)
         return format_swap(tx, label, address, syms, prices, balance)
 
     text = format_transfer(tx, label, address) or format_generic(tx, label, address)
