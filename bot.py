@@ -1170,9 +1170,10 @@ async def track_wallets(app: Application):
 HELP_TEXT = (
     "👁 <b>Solana Wallet Tracker</b>\n\n"
     "<b>Commands:</b>\n"
-    "/add <code>ADDRESS</code> <code>Label</code> — Start tracking a wallet\n"
-    "/remove <code>ADDRESS</code> — Stop tracking a wallet\n"
+    "/add — Add wallet(s) to track\n"
+    "/delete — Remove wallet(s)\n"
     "/list — Show all tracked wallets\n"
+    "/summary — Daily trading summary\n"
     "/help — Show this message\n\n"
     "<i>Alerts for: swaps, transfers, mints, burns, NFT activity</i>"
 )
@@ -1185,53 +1186,95 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add one or more wallets. Each line: ADDRESS Label"""
     add_chat(update.effective_chat.id)
-    args = context.args
 
-    if not args:
+    # Get full text after /add
+    raw = update.message.text or ""
+    body = raw.split(None, 1)[1] if len(raw.split(None, 1)) > 1 else ""
+
+    if not body.strip():
         await update.message.reply_text(
-            "Usage: /add <code>WALLET_ADDRESS</code> <code>Label</code>\n"
-            "Example: /add So11...abc MyWhale",
+            "Usage: /add <code>ADDRESS Label</code>\n\n"
+            "Add multiple at once (one per line):\n"
+            "/add\n<code>ADDRESS1 Whale1</code>\n<code>ADDRESS2 Whale2</code>",
             parse_mode="HTML",
         )
         return
 
-    address = args[0].strip()
-    label = " ".join(args[1:]) if len(args) > 1 else short(address)
+    lines = [l.strip() for l in body.strip().split("\n") if l.strip()]
+    added = []
+    errors = []
 
-    if not (32 <= len(address) <= 44):
-        await update.message.reply_text("❌ That doesn't look like a valid Solana address.")
-        return
+    for line in lines:
+        parts = line.split(None, 1)
+        address = parts[0].strip()
+        label = parts[1].strip() if len(parts) > 1 else short(address)
 
-    if add_wallet(address, label):
-        await update.message.reply_text(
-            f"✅ Now tracking <b>{label}</b>\n<code>{address}</code>",
-            parse_mode="HTML",
-        )
-        # Update Helius webhook with new wallet
+        if not (32 <= len(address) <= 44):
+            errors.append(f"❌ Invalid: <code>{address[:20]}...</code>")
+            continue
+
+        if add_wallet(address, label):
+            added.append(f"✅ <b>{label}</b>\n<code>{address}</code>")
+        else:
+            errors.append(f"⚠️ Already tracked: <code>{address[:12]}...</code>")
+
+    msg_parts = []
+    if added:
+        msg_parts.append("\n".join(added))
+    if errors:
+        msg_parts.append("\n".join(errors))
+
+    await update.message.reply_text("\n\n".join(msg_parts) or "Nothing to add.", parse_mode="HTML")
+
+    # Update Helius webhook with all wallets
+    if added:
         all_addrs = [a for a, _, _ in get_wallets()]
         await register_helius_webhook(all_addrs)
-    else:
-        await update.message.reply_text("⚠️ That wallet is already being tracked.")
 
-async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /remove <code>WALLET_ADDRESS</code>", parse_mode="HTML")
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete one or more wallets. Each line: ADDRESS"""
+    raw = update.message.text or ""
+    body = raw.split(None, 1)[1] if len(raw.split(None, 1)) > 1 else ""
+
+    if not body.strip():
+        await update.message.reply_text(
+            "Usage: /delete <code>ADDRESS</code>\n\n"
+            "Delete multiple at once (one per line):\n"
+            "/delete\n<code>ADDRESS1</code>\n<code>ADDRESS2</code>",
+            parse_mode="HTML",
+        )
         return
 
-    address = context.args[0].strip()
-    if remove_wallet(address):
-        await update.message.reply_text(
-            f"🗑 Stopped tracking <code>{address}</code>", parse_mode="HTML"
-        )
-    else:
-        await update.message.reply_text("❌ Wallet not found. Use /list to see tracked wallets.")
+    lines = [l.strip() for l in body.strip().split("\n") if l.strip()]
+    removed = []
+    errors = []
+
+    for line in lines:
+        address = line.split()[0].strip()
+        if remove_wallet(address):
+            removed.append(f"🗑 <code>{address}</code>")
+        else:
+            errors.append(f"❌ Not found: <code>{address[:12]}...</code>")
+
+    msg_parts = []
+    if removed:
+        msg_parts.append("\n".join(removed))
+    if errors:
+        msg_parts.append("\n".join(errors))
+
+    await update.message.reply_text("\n\n".join(msg_parts) or "Nothing to delete.", parse_mode="HTML")
+
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias for /delete"""
+    await cmd_delete(update, context)
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wallets = get_wallets()
     if not wallets:
         await update.message.reply_text(
-            "No wallets tracked yet.\nUse /add <code>ADDRESS</code> <code>Label</code> to add one.",
+            "No wallets tracked yet.\nUse /add <code>ADDRESS Label</code> to add one.",
             parse_mode="HTML",
         )
         return
@@ -1243,6 +1286,75 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👁 <b>Tracked Wallets ({len(wallets)})</b>\n\n{lines}",
         parse_mode="HTML",
     )
+
+async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Daily trading summary: most traded tokens across all tracked wallets."""
+    import time
+    wallets = get_wallets()
+    if not wallets:
+        await update.message.reply_text("No wallets tracked yet.", parse_mode="HTML")
+        return
+
+    await update.message.reply_text("⏳ Generating daily summary...", parse_mode="HTML")
+
+    now = int(time.time())
+    day_ago = now - 86400
+    token_trades: dict[str, dict] = {}  # mint → {sym, buys, sells, vol_usd}
+
+    for address, label, _ in wallets:
+        try:
+            txs = await fetch_transactions(address, limit=50)
+            if not txs:
+                continue
+            for tx in txs:
+                ts = tx.get("timestamp", 0)
+                if ts < day_ago:
+                    break
+                if tx.get("type") not in ("SWAP", "TRANSFER"):
+                    continue
+                tok_xfers = tx.get("tokenTransfers", [])
+                SOL_MINT = "So11111111111111111111111111111111111111112"
+                _BASE = {"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+                         "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So", SOL_MINT}
+                for xfer in tok_xfers:
+                    mint = xfer.get("mint", "")
+                    if not mint or mint in _BASE:
+                        continue
+                    sym = xfer.get("symbol") or await get_token_symbol(mint)
+                    is_buy = xfer.get("toUserAccount") == address
+                    amt = float(xfer.get("tokenAmount", 0))
+
+                    if mint not in token_trades:
+                        token_trades[mint] = {"sym": sym, "buys": 0, "sells": 0, "total": 0}
+                    if is_buy:
+                        token_trades[mint]["buys"] += 1
+                    else:
+                        token_trades[mint]["sells"] += 1
+                    token_trades[mint]["total"] += 1
+        except Exception as e:
+            print(f"[Summary] Error on {label}: {e}")
+
+    if not token_trades:
+        await update.message.reply_text("No trades found in the last 24 hours.", parse_mode="HTML")
+        return
+
+    # Sort by total trades
+    sorted_tokens = sorted(token_trades.items(), key=lambda x: x[1]["total"], reverse=True)
+
+    lines = ["📊 <b>24h Trading Summary</b>\n"]
+    for i, (mint, data) in enumerate(sorted_tokens[:15], 1):
+        sym = data["sym"]
+        mc = _mc_cache.get(mint, 0)
+        mc_str = f" | MC: {fmt_mc(mc)}" if mc else ""
+        lines.append(
+            f"{i}. <b>{sym}</b> — {data['total']} trades "
+            f"({data['buys']}🟢 {data['sells']}🔴){mc_str}\n"
+            f"   <code>{mint}</code>"
+        )
+
+    lines.append(f"\n<i>Across {len(wallets)} tracked wallets</i>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ─────────────────────────────────────────
@@ -1264,14 +1376,27 @@ async def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("summary", cmd_summary))
 
     print("🤖 Bot is running. Press Ctrl+C to stop.")
 
     async with app:
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+        # Set menu button commands
+        from telegram import BotCommand
+        await app.bot.set_my_commands([
+            BotCommand("start", "Menu"),
+            BotCommand("add", "Add wallet(s) to track"),
+            BotCommand("delete", "Remove wallet(s)"),
+            BotCommand("list", "Show tracked wallets"),
+            BotCommand("summary", "Daily trading summary"),
+            BotCommand("help", "Show help"),
+        ])
 
         # Start Helius webhook server for real-time alerts
         global _webhook_app_ref
