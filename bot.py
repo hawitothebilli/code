@@ -293,9 +293,8 @@ async def get_token_prices(mints: list[str]) -> dict[str, float]:
                             result[mint] = price
                         if mc:
                             _mc_cache[mint] = mc
-                    for mint, created in oldest.items():
-                        if created:
-                            _created_cache[mint] = created
+                    # Don't write _created_cache here — let get_token_age() handle it
+                    # (it picks the true oldest pair more reliably)
         except Exception as e:
             print(f"[Dexscreener] Price fetch failed: {e}")
 
