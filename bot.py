@@ -444,6 +444,22 @@ def format_swap(tx: dict, label: str, address: str,
         if n_in and not tok_got_raw:
             sol_got  = float(max(n_in,  key=lambda x: x.get("amount", 0))["amount"]) / 1e9
 
+    # ── Last-resort SOL capture ────────────────────────────────
+    # Pump AMM sets tokenOutputs but leaves nativeInput null, so sol_sent stays 0.
+    # Always check nativeTransfers if we received tokens but have no SOL sent/got yet.
+    if tok_got_raw and not sol_sent and not tok_sent_raw:
+        n_out_all = [x for x in nat_xfers
+                     if x.get("fromUserAccount") == address
+                     and float(x.get("amount", 0)) / 1e9 > 0.001]
+        if n_out_all:
+            sol_sent = float(max(n_out_all, key=lambda x: x.get("amount", 0))["amount"]) / 1e9
+    if tok_sent_raw and not sol_got and not tok_got_raw:
+        n_in_all = [x for x in nat_xfers
+                    if x.get("toUserAccount") == address
+                    and float(x.get("amount", 0)) / 1e9 > 0.001]
+        if n_in_all:
+            sol_got = float(max(n_in_all, key=lambda x: x.get("amount", 0))["amount"]) / 1e9
+
     # ── BUY or SELL? ───────────────────────────────────────────
     # BUY  = wallet spent SOL / sent a base token, received the meme token
     # SELL = wallet sent the meme token, received SOL
