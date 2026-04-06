@@ -22,8 +22,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(message)s"
 )
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import (Application, CommandHandler, ContextTypes,
+                          ConversationHandler, MessageHandler, filters)
 
 # ============================================================
 # CONFIG — keys are loaded from .env (never commit .env to git)
@@ -1185,24 +1186,30 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
 
+# Conversation states
+WAITING_ADD, WAITING_DELETE = range(2)
+
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add one or more wallets. Each line: ADDRESS Label"""
+    """Step 1: prompt user to send addresses."""
     add_chat(update.effective_chat.id)
+    await update.message.reply_text(
+        "📝 Send wallet address(es) to track.\n\n"
+        "Format: <code>ADDRESS Label</code>\n"
+        "One per line for multiple:\n"
+        "<code>ADDRESS1 Whale1\nADDRESS2 Whale2</code>\n\n"
+        "Send /cancel to cancel.",
+        parse_mode="HTML",
+    )
+    return WAITING_ADD
 
-    # Get full text after /add
-    raw = update.message.text or ""
-    body = raw.split(None, 1)[1] if len(raw.split(None, 1)) > 1 else ""
+async def add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2: process the addresses sent by user."""
+    body = (update.message.text or "").strip()
+    if not body:
+        await update.message.reply_text("❌ No addresses received. Try again or /cancel.")
+        return WAITING_ADD
 
-    if not body.strip():
-        await update.message.reply_text(
-            "Usage: /add <code>ADDRESS Label</code>\n\n"
-            "Add multiple at once (one per line):\n"
-            "/add\n<code>ADDRESS1 Whale1</code>\n<code>ADDRESS2 Whale2</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    lines = [l.strip() for l in body.strip().split("\n") if l.strip()]
+    lines = [l.strip() for l in body.split("\n") if l.strip()]
     added = []
     errors = []
 
@@ -1228,26 +1235,30 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n\n".join(msg_parts) or "Nothing to add.", parse_mode="HTML")
 
-    # Update Helius webhook with all wallets
     if added:
         all_addrs = [a for a, _, _ in get_wallets()]
         await register_helius_webhook(all_addrs)
 
+    return ConversationHandler.END
+
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Delete one or more wallets. Each line: ADDRESS"""
-    raw = update.message.text or ""
-    body = raw.split(None, 1)[1] if len(raw.split(None, 1)) > 1 else ""
+    """Step 1: prompt user to send addresses to delete."""
+    await update.message.reply_text(
+        "🗑 Send wallet address(es) to remove.\n"
+        "One per line for multiple.\n\n"
+        "Send /cancel to cancel.",
+        parse_mode="HTML",
+    )
+    return WAITING_DELETE
 
-    if not body.strip():
-        await update.message.reply_text(
-            "Usage: /delete <code>ADDRESS</code>\n\n"
-            "Delete multiple at once (one per line):\n"
-            "/delete\n<code>ADDRESS1</code>\n<code>ADDRESS2</code>",
-            parse_mode="HTML",
-        )
-        return
+async def delete_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2: process the addresses to delete."""
+    body = (update.message.text or "").strip()
+    if not body:
+        await update.message.reply_text("❌ No addresses received. Try again or /cancel.")
+        return WAITING_DELETE
 
-    lines = [l.strip() for l in body.strip().split("\n") if l.strip()]
+    lines = [l.strip() for l in body.split("\n") if l.strip()]
     removed = []
     errors = []
 
@@ -1265,10 +1276,11 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_parts.append("\n".join(errors))
 
     await update.message.reply_text("\n\n".join(msg_parts) or "Nothing to delete.", parse_mode="HTML")
+    return ConversationHandler.END
 
-async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Alias for /delete"""
-    await cmd_delete(update, context)
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wallets = get_wallets()
@@ -1373,11 +1385,22 @@ async def main():
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Conversation handlers for /add and /delete (two-step flow)
+    add_conv = ConversationHandler(
+        entry_points=[CommandHandler("add", cmd_add)],
+        states={WAITING_ADD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_receive)]},
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+    )
+    delete_conv = ConversationHandler(
+        entry_points=[CommandHandler("delete", cmd_delete), CommandHandler("remove", cmd_delete)],
+        states={WAITING_DELETE: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_receive)]},
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+    )
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("add", cmd_add))
-    app.add_handler(CommandHandler("delete", cmd_delete))
-    app.add_handler(CommandHandler("remove", cmd_remove))
+    app.add_handler(add_conv)
+    app.add_handler(delete_conv)
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("summary", cmd_summary))
 
@@ -1388,7 +1411,6 @@ async def main():
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
         # Set menu button commands
-        from telegram import BotCommand
         await app.bot.set_my_commands([
             BotCommand("start", "Menu"),
             BotCommand("add", "Add wallet(s) to track"),
