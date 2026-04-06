@@ -525,12 +525,11 @@ def format_swap(tx: dict, label: str, address: str,
 
     USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
     USDC_LINK = token_link("USDC", USDC_MINT)
-    # If paid with SOL: "0.0999 SOL (11.58 USDC)"
-    # If paid with USDC or other: "11.58 USDC"
+    # SOL swap: "0.0707 SOL ($5.78)"  |  USDC swap: "11.59 USDC ($11.59)"
     if sol_amt and in_usd >= 0.01:
-        in_usd_str = f"<b>{sol_amt:.4f}</b> {SOL_LINK} (<b>{in_usd:.2f}</b> {USDC_LINK})"
+        in_usd_str = f"<b>{sol_amt:.4f}</b> {SOL_LINK} (<b>{fmt_usd(in_usd)}</b>)"
     elif in_usd >= 0.01:
-        in_usd_str = f"<b>{in_usd:.2f}</b> {USDC_LINK}"
+        in_usd_str = f"<b>{in_usd:.2f}</b> {USDC_LINK} (<b>{fmt_usd(in_usd)}</b>)"
     else:
         in_usd_str = ""
     out_usd_str = f"(<b>{fmt_usd(out_usd)}</b>)"  if out_usd >= 0.01 else ""
