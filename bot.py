@@ -328,9 +328,7 @@ def fmt_age(created_ms: int) -> str:
     return f"{d}d {h}h" if h else f"{d}d"
 
 async def get_token_age(mint: str) -> int:
-    """Fetch the OLDEST pair creation time from Dexscreener for this token.
-    Uses the oldest pairCreatedAt across all pairs where the mint is either
-    the base or quote token — that gives the true 'first seen' age."""
+    """Fetch token pair creation time from Dexscreener. Returns timestamp in ms or 0."""
     if mint in _created_cache:
         return _created_cache[mint]
     try:
@@ -338,19 +336,13 @@ async def get_token_age(mint: str) -> int:
             resp = await client.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
             if resp.status_code == 200:
                 pairs = resp.json().get("pairs") or []
-                oldest = 0
-                for p in pairs:
-                    # Only consider pairs where our mint is base or quote
-                    base = p.get("baseToken", {}).get("address", "")
-                    quote = p.get("quoteToken", {}).get("address", "")
-                    if mint not in (base, quote):
-                        continue
-                    created = int(p.get("pairCreatedAt") or 0)
-                    if created and (oldest == 0 or created < oldest):
-                        oldest = created
-                if oldest:
-                    _created_cache[mint] = oldest
-                    return oldest
+                if pairs:
+                    # Pick pair with highest liquidity
+                    best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+                    created = int(best.get("pairCreatedAt") or 0)
+                    if created:
+                        _created_cache[mint] = created
+                        return created
     except Exception:
         pass
     return 0
@@ -606,7 +598,7 @@ def format_swap(tx: dict, label: str, address: str,
     out_usd_str = f"(<b>{fmt_usd(out_usd)}</b>)"  if out_usd >= 0.01 else ""
     fee_str     = f" [fee {fee_sol:.4f} {SOL_LINK}]"   if fee_sol > 0.0001 else ""
     tok_str     = f"<b>{format_amount(tok_amt)}</b>" if tok_amt else "<b>?</b>"
-    price_str   = f"@ <b>{fmt_usd(price_per)}</b>" if price_per else ""
+    price_str   = f"@ {fmt_usd(price_per)}" if price_per else ""
 
     if is_buy:
         swap_line = (f"💎 <b>{label}</b> swapped {in_usd_str} for "
@@ -1206,4 +1198,4 @@ async def main():
             await app.stop()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())       
