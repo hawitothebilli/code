@@ -909,6 +909,13 @@ async def format_transaction(tx: dict, label: str, address: str,
         if mint.startswith("0x"):
             return None
 
+    # Skip swaps where the tracked wallet is NOT the signer (feePayer).
+    # This filters out spam where someone else's swap passively sends
+    # tokens to the tracked wallet.
+    fee_payer = tx.get("feePayer", "")
+    if tx_type == "SWAP" and fee_payer and fee_payer != address:
+        return None
+
     # ── Detect if this tx has swap-like token activity ──────────
     # Helius sometimes types swaps as "TRANSFER" — detect and route to swap formatter
     tok_xfers = tx.get("tokenTransfers", [])
@@ -920,6 +927,12 @@ async def format_transaction(tx: dict, label: str, address: str,
                         if (x.get("fromUserAccount") == address or x.get("toUserAccount") == address)
                         and x.get("mint") not in _BASE]
     is_swap_like = tx_type == "SWAP" or (tx_type == "TRANSFER" and len(wallet_tok_xfers) > 0)
+
+    # For swap-like txs, only alert if wallet is the signer OR sent tokens
+    if is_swap_like and fee_payer and fee_payer != address:
+        wallet_sent = any(x.get("fromUserAccount") == address for x in tok_xfers)
+        if not wallet_sent:
+            return None  # wallet just received tokens passively — skip
 
     if is_swap_like:
         main_mint = ""
