@@ -504,25 +504,33 @@ def format_swap(tx: dict, label: str, address: str,
     # Show USD values rather than raw SOL amounts
     in_usd    = sol_usd_val or usd_val(tok_sent_raw, tok_sent_mint)
     out_usd   = tok_usd_val
+    # Helper: make any token name a clickable Solscan link
+    def token_link(sym: str, mint: str) -> str:
+        if mint:
+            return f'<a href="https://solscan.io/token/{mint}"><b>{sym}</b></a>'
+        return f"<b>{sym}</b>"
+
+    SOL_LINK = token_link("SOL", SOL_MINT)
+    main_link = token_link(main_sym, main_mint)
+
     in_usd_str  = f"USDC(<b>{fmt_usd(in_usd)}</b>)"   if in_usd  >= 0.01 else ""
     out_usd_str = f"(<b>{fmt_usd(out_usd)}</b>)"  if out_usd >= 0.01 else ""
-    fee_str     = f" [fee {fee_sol:.4f} SOL]"      if fee_sol > 0.0001 else ""
+    fee_str     = f" [fee {fee_sol:.4f} {SOL_LINK}]"   if fee_sol > 0.0001 else ""
     tok_str     = f"<b>{format_amount(tok_amt)}</b>" if tok_amt else "<b>?</b>"
     price_str   = f"@ <b>{fmt_usd(price_per)}</b>" if price_per else ""
 
-    # Clickable token name → links to Solscan token page
-    sym_link = f'<a href="https://solscan.io/token/{main_mint}"><b>{main_sym}</b></a>' if main_mint else f"<b>{main_sym}</b>"
-
     if is_buy:
         swap_line = (f"💎 <b>{label}</b> swapped {in_usd_str} for "
-                     f"{tok_str} {sym_link} {out_usd_str} {price_str}{fee_str}".strip())
+                     f"{tok_str} {main_link} {out_usd_str} {price_str}{fee_str}".strip())
     else:
-        swap_line = (f"💎 <b>{label}</b> swapped {tok_str} {sym_link} {out_usd_str} for "
+        swap_line = (f"💎 <b>{label}</b> swapped {tok_str} {main_link} {out_usd_str} for "
                      f"{in_usd_str} {price_str}{fee_str}".strip())
 
     # ── Holdings line ──────────────────────────────────────────
     if balance > 0:
-        holds_str = f"🤚 Holds: <b>{format_amount(balance)} {main_sym}</b> total"
+        holds_str = f"🤚 Holds: <b>{format_amount(balance)} {main_link}</b> total"
+    elif balance == 0 and not is_buy and main_mint:
+        holds_str = f"🤚 Holds: <b>0 {main_link}</b> (fully sold)"
     else:
         holds_str = ""
 
@@ -546,7 +554,7 @@ def format_swap(tx: dict, label: str, address: str,
 
     # ── Assemble message ───────────────────────────────────────
     lines = [
-        f"{action_emoji} <b>{action_word} {main_sym}</b> on {source}",
+        f"{action_emoji} <b>{action_word}</b> {main_link} on {source}",
         f"💎 <b>{label}</b>",
         f"<code>{address}</code>",
         "",
@@ -558,7 +566,8 @@ def format_swap(tx: dict, label: str, address: str,
         lines.append(pnl_str)
     lines += [
         "",
-        f"🟡 <b>#{main_sym}</b> | {mc_str}",
+        f"🟡 <b>#{main_sym}</b> | {mc_str}"
+        + (f'<a href="https://dexscreener.com/solana/{main_mint}">DexS</a>' if main_mint else ""),
         f"<code>{main_mint}</code>",
         "",
         f'🔗 <a href="https://solscan.io/tx/{sig}">Solscan</a>',
