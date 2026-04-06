@@ -12,6 +12,8 @@ import sqlite3
 import httpx
 import logging
 import os
+import json
+from aiohttp import web
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -28,7 +30,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ============================================================
 HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-POLL_INTERVAL = 30  # Seconds between wallet checks (30 is a good default)
+POLL_INTERVAL = 30  # Fallback polling interval (webhook handles real-time)
+WEBHOOK_PORT  = 8080  # Port for Helius webhook receiver
 
 # ── Transfer spam filter ──────────────────────────────────────
 # Incoming transfers with fewer recipients than this are likely dust/spam airdrops
@@ -298,7 +301,7 @@ def fmt_usd(val: float) -> str:
     return f"${val:.6f}"
 
 def fmt_age(created_ms: int) -> str:
-    """Format token age as '5m', '3h', '2d' etc."""
+    """Format token age as '5m', '3h 20m', '2d 5h' etc."""
     import time
     if not created_ms:
         return ""
@@ -310,8 +313,32 @@ def fmt_age(created_ms: int) -> str:
     if elapsed < 3600:
         return f"{elapsed // 60}m"
     if elapsed < 86400:
-        return f"{elapsed // 3600}h"
-    return f"{elapsed // 86400}d"
+        h = elapsed // 3600
+        m = (elapsed % 3600) // 60
+        return f"{h}h {m}m" if m else f"{h}h"
+    d = elapsed // 86400
+    h = (elapsed % 86400) // 3600
+    return f"{d}d {h}h" if h else f"{d}d"
+
+async def get_token_age(mint: str) -> int:
+    """Fetch token pair creation time from Dexscreener. Returns timestamp in ms or 0."""
+    if mint in _created_cache:
+        return _created_cache[mint]
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
+            if resp.status_code == 200:
+                pairs = resp.json().get("pairs") or []
+                if pairs:
+                    # Pick pair with highest liquidity
+                    best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+                    created = int(best.get("pairCreatedAt") or 0)
+                    if created:
+                        _created_cache[mint] = created
+                        return created
+    except Exception:
+        pass
+    return 0
 
 async def get_wallet_token_balance(wallet: str, mint: str) -> float:
     """
@@ -328,7 +355,7 @@ async def get_wallet_token_balance(wallet: str, mint: str) -> float:
                     "params": [
                         wallet,
                         {"mint": mint},
-                        {"encoding": "jsonParsed"}
+                        {"encoding": "jsonParsed", "commitment": "confirmed"}
                     ]
                 }
             )
@@ -530,7 +557,7 @@ def format_swap(tx: dict, label: str, address: str,
     mc = _mc_cache.get(main_mint, 0)
     mc_str = f"MC: <b>{fmt_mc(mc)}</b> | " if mc else ""
     created_ts = _created_cache.get(main_mint, 0)
-    age_str = f"Seen: <b>{fmt_age(created_ts)}</b> | " if created_ts else ""
+    age_str = f"Seen: <b>{fmt_age(created_ts)}</b> | " if created_ts and fmt_age(created_ts) else ""
 
     # ── Format the swap line ───────────────────────────────────
     # Show USD values rather than raw SOL amounts
@@ -754,20 +781,12 @@ async def format_transaction(tx: dict, label: str, address: str,
         )
         balance = 0.0
         if main_mint:
-            balance = await get_wallet_token_balance(address, main_mint)
+            # Fetch token age if not cached
+            if main_mint not in _created_cache:
+                await get_token_age(main_mint)
             if is_sell:
-                sold_amount = sum(
-                    float(x.get("tokenAmount", 0))
-                    for x in tok_xfers
-                    if x.get("fromUserAccount") == address and x.get("mint") == main_mint
-                )
-                if balance == 0 and sold_amount > 0:
-                    # RPC might show 0 during swap — wait and retry
-                    await asyncio.sleep(3)
-                    balance = await get_wallet_token_balance(address, main_mint)
-                elif balance >= sold_amount > 0:
-                    # RPC still shows pre-sell state — subtract sold
-                    balance = balance - sold_amount
+                await asyncio.sleep(4)  # wait for on-chain state to confirm
+            balance = await get_wallet_token_balance(address, main_mint)
         return format_swap(tx, label, address, syms, prices, balance)
 
     text = format_transfer(tx, label, address) or format_generic(tx, label, address)
@@ -777,12 +796,142 @@ async def format_transaction(tx: dict, label: str, address: str,
 
 
 # ─────────────────────────────────────────
-# TRACKER LOOP
+# HELIUS WEBHOOK (real-time)
+# ─────────────────────────────────────────
+
+_webhook_app_ref = None  # will hold the Telegram Application
+
+async def webhook_handler(request):
+    """Handle incoming Helius webhook POST with parsed transactions."""
+    try:
+        body = await request.json()
+        txs = body if isinstance(body, list) else [body]
+        app = _webhook_app_ref
+        if not app:
+            return web.Response(status=200)
+
+        wallets = {addr: label for addr, label, _ in get_wallets()}
+        chats = get_chats()
+
+        for tx in txs:
+            # Determine which tracked wallet this tx belongs to
+            address = ""
+            label = ""
+            for acc in tx.get("accountData", []):
+                a = acc.get("account", "")
+                if a in wallets:
+                    address = a
+                    label = wallets[a]
+                    break
+            if not address:
+                # Check token/native transfers for tracked wallets
+                for xfer in tx.get("tokenTransfers", []) + tx.get("nativeTransfers", []):
+                    for key in ("fromUserAccount", "toUserAccount"):
+                        a = xfer.get(key, "")
+                        if a in wallets:
+                            address = a
+                            label = wallets[a]
+                            break
+                    if address:
+                        break
+            if not address:
+                continue
+
+            # Update cursor so polling doesn't re-send
+            sig = tx.get("signature", "")
+            if sig:
+                update_last_signature(address, sig)
+
+            syms, prices = await resolve_symbols(tx)
+            result = await format_transaction(tx, label, address, syms, prices)
+            if result is None:
+                continue
+
+            msg, keyboard = result
+            for chat_id in chats:
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id, text=msg, parse_mode="HTML",
+                        disable_web_page_preview=True, reply_markup=keyboard,
+                    )
+                except Exception as e:
+                    print(f"[Webhook→TG] Failed: {e}")
+
+    except Exception as e:
+        print(f"[Webhook] Error: {e}")
+    return web.Response(status=200)
+
+async def register_helius_webhook(wallets: list[str]):
+    """Create or update a Helius webhook for the tracked wallets."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            # List existing webhooks
+            resp = await client.get(
+                f"https://api.helius.xyz/v0/webhooks?api-key={HELIUS_API_KEY}"
+            )
+            existing = resp.json() if resp.status_code == 200 else []
+
+            # Find our webhook
+            our_hook = None
+            for wh in existing:
+                if wh.get("webhookURL", "").endswith(f":{WEBHOOK_PORT}/helius"):
+                    our_hook = wh
+                    break
+
+            # Get server public IP for webhook URL
+            ip_resp = await client.get("https://api.ipify.org")
+            public_ip = ip_resp.text.strip()
+            webhook_url = f"http://{public_ip}:{WEBHOOK_PORT}/helius"
+
+            payload = {
+                "webhookURL": webhook_url,
+                "transactionTypes": ["Any"],
+                "accountAddresses": wallets,
+                "webhookType": "enhanced",
+            }
+
+            if our_hook:
+                # Update existing
+                hook_id = our_hook["webhookID"]
+                resp = await client.put(
+                    f"https://api.helius.xyz/v0/webhooks/{hook_id}?api-key={HELIUS_API_KEY}",
+                    json=payload,
+                )
+                print(f"[Webhook] Updated: {webhook_url} → {len(wallets)} wallets")
+            else:
+                # Create new
+                resp = await client.post(
+                    f"https://api.helius.xyz/v0/webhooks?api-key={HELIUS_API_KEY}",
+                    json=payload,
+                )
+                print(f"[Webhook] Created: {webhook_url} → {len(wallets)} wallets")
+
+    except Exception as e:
+        print(f"[Webhook] Registration failed: {e}")
+
+async def start_webhook_server():
+    """Start aiohttp server to receive Helius webhooks."""
+    app = web.Application()
+    app.router.add_post("/helius", webhook_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
+    await site.start()
+    print(f"🔔 Webhook server listening on port {WEBHOOK_PORT}")
+
+    # Register webhook with Helius
+    wallets_list = [addr for addr, _, _ in get_wallets()]
+    if wallets_list:
+        await register_helius_webhook(wallets_list)
+
+
+# ─────────────────────────────────────────
+# TRACKER LOOP (fallback — catches anything webhook missed)
 # ─────────────────────────────────────────
 
 async def track_wallets(app: Application):
     """Background loop: polls wallets and sends Telegram alerts on new activity."""
-    print("👁  Tracker started — polling every", POLL_INTERVAL, "seconds")
+    print("👁  Tracker started — polling every", POLL_INTERVAL, "seconds (fallback)")
     await asyncio.sleep(3)  # Let the bot fully start first
 
     while True:
@@ -892,6 +1041,9 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Now tracking <b>{label}</b>\n<code>{address}</code>",
             parse_mode="HTML",
         )
+        # Update Helius webhook with new wallet
+        all_addrs = [a for a, _, _ in get_wallets()]
+        await register_helius_webhook(all_addrs)
     else:
         await update.message.reply_text("⚠️ That wallet is already being tracked.")
 
@@ -954,7 +1106,12 @@ async def main():
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
-        # Start the wallet tracker in the background
+        # Start Helius webhook server for real-time alerts
+        global _webhook_app_ref
+        _webhook_app_ref = app
+        await start_webhook_server()
+
+        # Start the wallet tracker as fallback
         tracker = asyncio.create_task(track_wallets(app))
 
         # Keep running until Ctrl+C
