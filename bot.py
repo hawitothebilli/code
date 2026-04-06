@@ -955,16 +955,19 @@ async def webhook_handler(request):
 
         for tx in txs:
             # Determine which tracked wallet this tx belongs to
+            # Only match if the wallet is the fee payer (signer) or
+            # directly involved in token/native transfers
             address = ""
             label = ""
-            for acc in tx.get("accountData", []):
-                a = acc.get("account", "")
-                if a in wallets:
-                    address = a
-                    label = wallets[a]
-                    break
+
+            # 1. Check if feePayer is a tracked wallet
+            fp = tx.get("feePayer", "")
+            if fp in wallets:
+                address = fp
+                label = wallets[fp]
+
+            # 2. Check token/native transfers for tracked wallets
             if not address:
-                # Check token/native transfers for tracked wallets
                 for xfer in tx.get("tokenTransfers", []) + tx.get("nativeTransfers", []):
                     for key in ("fromUserAccount", "toUserAccount"):
                         a = xfer.get(key, "")
