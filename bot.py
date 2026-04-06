@@ -657,27 +657,14 @@ def format_transfer(tx: dict, label: str, address: str) -> str:
     native_xfers = tx.get("nativeTransfers", [])
     sig = tx.get("signature", "")
 
-    # ── Skip transfers that are really swaps ────────────────────
-    # If wallet sent SOL and received tokens (or vice-versa), it's a swap's
-    # underlying transfers — the SWAP formatter already handles this nicely.
-    SOL_MINT = "So11111111111111111111111111111111111111112"
-    wallet_tok_in = [x for x in token_xfers
-                     if x.get("toUserAccount") == address and x.get("mint") != SOL_MINT]
-    wallet_tok_out = [x for x in token_xfers
-                      if x.get("fromUserAccount") == address and x.get("mint") != SOL_MINT]
-    wallet_sol_out = sum(float(x.get("amount", 0)) / 1e9
-                         for x in native_xfers if x.get("fromUserAccount") == address)
-    wallet_sol_in = sum(float(x.get("amount", 0)) / 1e9
-                        for x in native_xfers if x.get("toUserAccount") == address)
-    # Pattern: sent SOL + received tokens = buy swap
-    if wallet_tok_in and wallet_sol_out > 0.001:
-        return None
-    # Pattern: sent tokens + received SOL = sell swap
-    if wallet_tok_out and wallet_sol_in > 0.001:
-        return None
-    # Pattern: sent tokens + received different tokens = token-to-token swap
-    if wallet_tok_in and wallet_tok_out:
-        return None
+    # ── Skip transfers that are really swaps / DEX activity ─────
+    # Any tx where the wallet has token transfers is almost certainly a swap
+    # or DEX interaction — the SWAP formatter handles these properly.
+    # We only want to show pure SOL-only transfers here.
+    wallet_tok_xfers = [x for x in token_xfers
+                        if x.get("fromUserAccount") == address or x.get("toUserAccount") == address]
+    if wallet_tok_xfers:
+        return None  # has token activity → not a simple transfer
     # ────────────────────────────────────────────────────────────
 
     # ── Spam / dust filter ──────────────────────────────────────
@@ -748,6 +735,18 @@ def format_generic(tx: dict, label: str, address: str) -> str:
     tx_type = tx.get("type", "UNKNOWN").replace("_", " ").title()
     desc = tx.get("description", "")
     sig = tx.get("signature", "")
+
+    # Skip tiny SOL transfers described in the description field
+    if desc:
+        import re
+        sol_match = re.search(r"transferred.*?([\d.]+)\s*SOL", desc, re.IGNORECASE)
+        if sol_match:
+            try:
+                sol_amt = float(sol_match.group(1))
+                if sol_amt < MIN_INCOMING_SOL:
+                    return None
+            except ValueError:
+                pass
 
     msg = (
         f"⚡ <b>{tx_type}</b>\n"
