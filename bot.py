@@ -480,6 +480,16 @@ def format_swap(tx: dict, label: str, address: str,
         tok_amt   = tok_sent_raw
         tok_mint  = tok_sent_mint
 
+    # ── Skip base-token swaps (SOL↔USDC, WSOL↔USDT etc.) ────
+    _BASE_MINTS = {
+        "So11111111111111111111111111111111111111112",   # WSOL
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", # USDC
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+        "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",  # mSOL
+    }
+    if main_mint in _BASE_MINTS:
+        return None  # not a meme/token trade, skip
+
     action_emoji = "🟢" if is_buy else "🔴"
     action_word  = "BUY"  if is_buy else "SELL"
 
@@ -514,8 +524,12 @@ def format_swap(tx: dict, label: str, address: str,
     main_link = token_link(main_sym, main_mint)
 
     USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-    USDC_LINK = f'<a href="https://solscan.io/token/{USDC_MINT}">USDC</a>'
-    in_usd_str  = f"{USDC_LINK}(<b>{fmt_usd(in_usd)}</b>)"   if in_usd  >= 0.01 else ""
+    USDC_LINK = token_link("USDC", USDC_MINT)
+    # Show amount + USDC link (e.g. "12.50 USDC")
+    if in_usd >= 0.01:
+        in_usd_str = f"<b>{in_usd:.2f}</b> {USDC_LINK}"
+    else:
+        in_usd_str = ""
     out_usd_str = f"(<b>{fmt_usd(out_usd)}</b>)"  if out_usd >= 0.01 else ""
     fee_str     = f" [fee {fee_sol:.4f} {SOL_LINK}]"   if fee_sol > 0.0001 else ""
     tok_str     = f"<b>{format_amount(tok_amt)}</b>" if tok_amt else "<b>?</b>"
