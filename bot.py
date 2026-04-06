@@ -657,6 +657,29 @@ def format_transfer(tx: dict, label: str, address: str) -> str:
     native_xfers = tx.get("nativeTransfers", [])
     sig = tx.get("signature", "")
 
+    # ── Skip transfers that are really swaps ────────────────────
+    # If wallet sent SOL and received tokens (or vice-versa), it's a swap's
+    # underlying transfers — the SWAP formatter already handles this nicely.
+    SOL_MINT = "So11111111111111111111111111111111111111112"
+    wallet_tok_in = [x for x in token_xfers
+                     if x.get("toUserAccount") == address and x.get("mint") != SOL_MINT]
+    wallet_tok_out = [x for x in token_xfers
+                      if x.get("fromUserAccount") == address and x.get("mint") != SOL_MINT]
+    wallet_sol_out = sum(float(x.get("amount", 0)) / 1e9
+                         for x in native_xfers if x.get("fromUserAccount") == address)
+    wallet_sol_in = sum(float(x.get("amount", 0)) / 1e9
+                        for x in native_xfers if x.get("toUserAccount") == address)
+    # Pattern: sent SOL + received tokens = buy swap
+    if wallet_tok_in and wallet_sol_out > 0.001:
+        return None
+    # Pattern: sent tokens + received SOL = sell swap
+    if wallet_tok_out and wallet_sol_in > 0.001:
+        return None
+    # Pattern: sent tokens + received different tokens = token-to-token swap
+    if wallet_tok_in and wallet_tok_out:
+        return None
+    # ────────────────────────────────────────────────────────────
+
     # ── Spam / dust filter ──────────────────────────────────────
     # If many different accounts received SOL in one tx, it's a mass airdrop/spam
     native_recipients = {x.get("toUserAccount") for x in native_xfers}
@@ -789,7 +812,13 @@ async def format_transaction(tx: dict, label: str, address: str,
             balance = await get_wallet_token_balance(address, main_mint)
         return format_swap(tx, label, address, syms, prices, balance)
 
-    text = format_transfer(tx, label, address) or format_generic(tx, label, address)
+    if tx_type == "TRANSFER":
+        text = format_transfer(tx, label, address)
+        # If format_transfer returned None, it was filtered (swap/dust/spam) — don't fallback
+        if text is None:
+            return None
+        return text, None
+    text = format_generic(tx, label, address)
     if text is None:
         return None
     return text, None   # no keyboard for non-swap alerts
