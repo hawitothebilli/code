@@ -733,9 +733,16 @@ async def format_transaction(tx: dict, label: str, address: str,
         )
         balance = 0.0
         if main_mint:
-            if is_sell:
-                await asyncio.sleep(2)  # let on-chain state settle before reading balance
             balance = await get_wallet_token_balance(address, main_mint)
+            # On sells: if RPC still shows pre-sell balance, subtract the sold amount
+            if is_sell and balance > 0:
+                sold_amount = sum(
+                    float(x.get("tokenAmount", 0))
+                    for x in tok_xfers
+                    if x.get("fromUserAccount") == address and x.get("mint") == main_mint
+                )
+                if sold_amount > 0 and balance >= sold_amount:
+                    balance = balance - sold_amount
         return format_swap(tx, label, address, syms, prices, balance)
 
     text = format_transfer(tx, label, address) or format_generic(tx, label, address)
