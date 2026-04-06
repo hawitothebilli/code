@@ -311,7 +311,7 @@ def fmt_usd(val: float) -> str:
         else:
             break
     sig_digits = after_dot[zeros:][:2]  # first 2 significant digits
-    if zeros >= 3:
+    if zeros >= 5:
         subscript = "".join(chr(0x2080 + int(d)) for d in str(zeros))
         return f"$0.0{subscript}{sig_digits}"
     return f"${val:.6f}"
@@ -597,16 +597,17 @@ def format_swap(tx: dict, label: str, address: str,
 
     USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
     USDC_LINK = token_link("USDC", USDC_MINT)
+    USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+    _STABLE_MINTS = {SOL_MINT, USDC_MINT, USDT_MINT, "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"}
     # SOL swap: "0.1015 SOL ($8.36)"  |  USDC swap: "11.59 USDC ($11.59)"
-    # Token-to-token: convert to SOL equivalent
+    # Token-to-token: show actual input token with amount
     if sol_amt and in_usd >= 0.01:
         in_usd_str = f"<b>{sol_amt:.4f}</b> {SOL_LINK} (<b>{fmt_usd(in_usd)}</b>)"
     elif in_usd >= 0.01:
-        sol_price = prices.get(SOL_MINT, 0)
-        if sol_price and tok_sent_mint and tok_sent_mint not in (SOL_MINT, USDC_MINT):
-            # Token-to-token swap — show SOL equivalent
-            sol_equiv = in_usd / sol_price
-            in_usd_str = f"<b>{sol_equiv:.4f}</b> {SOL_LINK} (<b>{fmt_usd(in_usd)}</b>)"
+        if tok_sent_mint and tok_sent_mint not in _STABLE_MINTS:
+            # Token-to-token swap — show actual input token (e.g. "50,000 CAPY ($11.58)")
+            sent_link = token_link(tok_sent_sym, tok_sent_mint)
+            in_usd_str = f"<b>{format_amount(tok_sent_raw)}</b> {sent_link} (<b>{fmt_usd(in_usd)}</b>)"
         else:
             in_usd_str = f"<b>{in_usd:.2f}</b> {USDC_LINK} (<b>{fmt_usd(in_usd)}</b>)"
     else:
