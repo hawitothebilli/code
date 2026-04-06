@@ -162,6 +162,7 @@ KNOWN_TOKENS = {
 }
 
 # In-memory caches
+_processed_sigs: set[str] = set()     # dedup: signatures already sent to Telegram
 _symbol_cache: dict[str, str] = {}
 _mc_cache: dict[str, float] = {}      # mint → market cap USD
 _created_cache: dict[str, int] = {}   # mint → pair created timestamp (ms)
@@ -784,8 +785,7 @@ async def format_transaction(tx: dict, label: str, address: str,
             # Fetch token age if not cached
             if main_mint not in _created_cache:
                 await get_token_age(main_mint)
-            if is_sell:
-                await asyncio.sleep(4)  # wait for on-chain state to confirm
+            # Always read balance immediately (same as buys — RPC confirmed state)
             balance = await get_wallet_token_balance(address, main_mint)
         return format_swap(tx, label, address, syms, prices, balance)
 
@@ -842,12 +842,26 @@ async def webhook_handler(request):
             if sig:
                 update_last_signature(address, sig)
 
+            # ── Dedup: skip if we already sent this signature ──
+            if sig and sig in _processed_sigs:
+                continue
+            # ───────────────────────────────────────────────────
+
             syms, prices = await resolve_symbols(tx)
             result = await format_transaction(tx, label, address, syms, prices)
             if result is None:
                 continue
 
             msg, keyboard = result
+
+            # ── Mark as processed BEFORE sending ──
+            if sig:
+                _processed_sigs.add(sig)
+                # Keep set bounded to last 2000 entries
+                if len(_processed_sigs) > 2000:
+                    _processed_sigs.clear()
+            # ──────────────────────────────────────
+
             for chat_id in chats:
                 try:
                     await app.bot.send_message(
@@ -968,6 +982,13 @@ async def track_wallets(app: Application):
 
                 # Alert for each new transaction (oldest first)
                 for tx in reversed(new_txs):
+                    tx_sig = tx.get("signature", "")
+
+                    # ── Dedup: skip if webhook already sent this ──
+                    if tx_sig and tx_sig in _processed_sigs:
+                        continue
+                    # ──────────────────────────────────────────────
+
                     # Resolve token symbols + USD prices before formatting
                     syms, prices = await resolve_symbols(tx)
                     result = await format_transaction(tx, label, address, syms, prices)
@@ -975,6 +996,13 @@ async def track_wallets(app: Application):
                         continue
 
                     msg, keyboard = result
+
+                    # ── Mark as processed BEFORE sending ──
+                    if tx_sig:
+                        _processed_sigs.add(tx_sig)
+                        if len(_processed_sigs) > 2000:
+                            _processed_sigs.clear()
+                    # ──────────────────────────────────────
 
                     for chat_id in chats:
                         try:
