@@ -34,6 +34,21 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 POLL_INTERVAL = 30  # Fallback polling interval (webhook handles real-time)
 WEBHOOK_PORT  = 8080  # Port for Helius webhook receiver
 
+# ── Access control ───────────────────────────────────────────
+# Comma-separated Telegram user IDs allowed to use the bot.
+# Set in .env: ALLOWED_USERS=123456789,987654321
+# Leave empty to allow everyone (no restriction).
+ALLOWED_USERS: set[int] = set()
+_raw_users = os.getenv("ALLOWED_USERS", "")
+if _raw_users.strip():
+    ALLOWED_USERS = {int(x.strip()) for x in _raw_users.split(",") if x.strip()}
+
+def is_authorized(user_id: int) -> bool:
+    """Check if a user is allowed to use the bot."""
+    if not ALLOWED_USERS:
+        return True  # no restriction set
+    return user_id in ALLOWED_USERS
+
 # ── Transfer spam filter ──────────────────────────────────────
 # Incoming transfers with fewer recipients than this are likely dust/spam airdrops
 # (e.g. the odinbot sending tiny SOL to 20 wallets at once)
@@ -1191,11 +1206,19 @@ HELP_TEXT = (
     "<i>Alerts for: swaps, transfers, mints, burns, NFT activity</i>"
 )
 
+UNAUTHORIZED_MSG = "🔒 You are not authorized to use this bot."
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(UNAUTHORIZED_MSG)
+        return
     add_chat(update.effective_chat.id)
     await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(UNAUTHORIZED_MSG)
+        return
     await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
 
 # Conversation states
@@ -1203,6 +1226,9 @@ WAITING_ADD, WAITING_DELETE = range(2)
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 1: prompt user to send addresses."""
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(UNAUTHORIZED_MSG)
+        return ConversationHandler.END
     add_chat(update.effective_chat.id)
     await update.message.reply_text(
         "📝 Send wallet address(es) to track.\n\n"
@@ -1255,6 +1281,9 @@ async def add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 1: prompt user to send addresses to delete."""
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(UNAUTHORIZED_MSG)
+        return ConversationHandler.END
     await update.message.reply_text(
         "🗑 Send wallet address(es) to remove.\n"
         "One per line for multiple.\n\n"
@@ -1295,6 +1324,9 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(UNAUTHORIZED_MSG)
+        return
     wallets = get_wallets()
     if not wallets:
         await update.message.reply_text(
@@ -1313,6 +1345,9 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Daily trading summary: most traded tokens across all tracked wallets."""
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(UNAUTHORIZED_MSG)
+        return
     import time
     wallets = get_wallets()
     if not wallets:
