@@ -337,8 +337,8 @@ def fmt_age(created_ms: int) -> str:
     return f"{d}d {h}h" if h else f"{d}d"
 
 async def get_token_age(mint: str) -> int:
-    """Fetch token pair creation time from Dexscreener. Returns timestamp in ms or 0."""
-    if mint in _created_cache:
+    """Fetch token pair creation time + MC from Dexscreener. Returns timestamp in ms or 0."""
+    if mint in _created_cache and mint in _mc_cache:
         return _created_cache[mint]
     try:
         async with httpx.AsyncClient(timeout=8) as client:
@@ -351,7 +351,20 @@ async def get_token_age(mint: str) -> int:
                     created = int(best.get("pairCreatedAt") or 0)
                     if created:
                         _created_cache[mint] = created
-                        return created
+                    # Also cache MC — use pair where mint is baseToken
+                    base_pairs = [p for p in pairs
+                                  if p.get("baseToken", {}).get("address") == mint]
+                    if base_pairs:
+                        bp = max(base_pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+                        mc = float(bp.get("marketCap") or bp.get("fdv") or 0)
+                        if mc:
+                            _mc_cache[mint] = mc
+                    elif pairs:
+                        # Token is always quoteToken — use fdv if available
+                        mc = float(best.get("fdv") or 0)
+                        if mc:
+                            _mc_cache[mint] = mc
+                    return created
     except Exception:
         pass
     return 0
@@ -679,23 +692,61 @@ def format_swap(tx: dict, label: str, address: str,
         lines.append(holds_str)
     if pnl_str:
         lines.append(pnl_str)
-    lines += [
-        "",
-        f"🟡 <b>#{main_sym}</b> | {mc_str}{age_str}"
-        + (f'<a href="https://dexscreener.com/solana/{main_mint}">DexS</a> · <a href="https://gmgn.ai/sol/token/{main_mint}">GMGN</a>' if main_mint else ""),
-        f"<code>{main_mint}</code>",
-        "",
-        f'🔗 <a href="https://solscan.io/tx/{sig}">Solscan</a>',
-    ]
+    if is_token_swap:
+        # Show info block for BOTH tokens
+        sent_mc = _mc_cache.get(tok_sent_mint, 0)
+        sent_mc_str = f"MC: <b>{fmt_mc(sent_mc)}</b> | " if sent_mc else ""
+        sent_age_ts = _created_cache.get(tok_sent_mint, 0)
+        sent_age_str = f"Seen: <b>{fmt_age(sent_age_ts)}</b> | " if sent_age_ts and fmt_age(sent_age_ts) else ""
+        got_mc = _mc_cache.get(tok_got_mint, 0)
+        got_mc_str = f"MC: <b>{fmt_mc(got_mc)}</b> | " if got_mc else ""
+        got_age_ts = _created_cache.get(tok_got_mint, 0)
+        got_age_str = f"Seen: <b>{fmt_age(got_age_ts)}</b> | " if got_age_ts and fmt_age(got_age_ts) else ""
+
+        sent_dex = f'<a href="https://dexscreener.com/solana/{tok_sent_mint}">DexS</a> · <a href="https://gmgn.ai/sol/token/{tok_sent_mint}">GMGN</a>'
+        got_dex = f'<a href="https://dexscreener.com/solana/{tok_got_mint}">DexS</a> · <a href="https://gmgn.ai/sol/token/{tok_got_mint}">GMGN</a>'
+
+        lines += [
+            "",
+            f"🟡 <b>#{tok_sent_sym}</b> | {sent_mc_str}{sent_age_str}{sent_dex}",
+            f"<code>{tok_sent_mint}</code>",
+            f"🟡 <b>#{tok_got_sym}</b> | {got_mc_str}{got_age_str}{got_dex}",
+            f"<code>{tok_got_mint}</code>",
+            "",
+            f'🔗 <a href="https://solscan.io/tx/{sig}">Solscan</a>',
+        ]
+    else:
+        lines += [
+            "",
+            f"🟡 <b>#{main_sym}</b> | {mc_str}{age_str}"
+            + (f'<a href="https://dexscreener.com/solana/{main_mint}">DexS</a> · <a href="https://gmgn.ai/sol/token/{main_mint}">GMGN</a>' if main_mint else ""),
+            f"<code>{main_mint}</code>",
+            "",
+            f'🔗 <a href="https://solscan.io/tx/{sig}">Solscan</a>',
+        ]
 
     text = "\n".join(lines)
 
     # ── Inline buttons ─────────────────────────────────────────
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"🦎 GMGN",   url=f"https://gmgn.ai/sol/token/{main_mint}"),
-        InlineKeyboardButton(f"⚡ Trojan",  url=f"https://t.me/solana_trojanbot?start=r-ref_{main_mint}"),
-        InlineKeyboardButton(f"🌸 Bloom",   url=f"https://t.me/BloomSolana_bot?start={main_mint}"),
-    ]])
+    if is_token_swap:
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(f"🦎 GMGN: {tok_sent_sym}", url=f"https://gmgn.ai/sol/token/{tok_sent_mint}"),
+                InlineKeyboardButton(f"⚡ Trojan: {tok_sent_sym}", url=f"https://t.me/solana_trojanbot?start=r-ref_{tok_sent_mint}"),
+                InlineKeyboardButton(f"🌸 Bloom: {tok_sent_sym}", url=f"https://t.me/BloomSolana_bot?start={tok_sent_mint}"),
+            ],
+            [
+                InlineKeyboardButton(f"🦎 GMGN: {tok_got_sym}", url=f"https://gmgn.ai/sol/token/{tok_got_mint}"),
+                InlineKeyboardButton(f"⚡ Trojan: {tok_got_sym}", url=f"https://t.me/solana_trojanbot?start=r-ref_{tok_got_mint}"),
+                InlineKeyboardButton(f"🌸 Bloom: {tok_got_sym}", url=f"https://t.me/BloomSolana_bot?start={tok_got_mint}"),
+            ],
+        ])
+    else:
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"🦎 GMGN",   url=f"https://gmgn.ai/sol/token/{main_mint}"),
+            InlineKeyboardButton(f"⚡ Trojan",  url=f"https://t.me/solana_trojanbot?start=r-ref_{main_mint}"),
+            InlineKeyboardButton(f"🌸 Bloom",   url=f"https://t.me/BloomSolana_bot?start={main_mint}"),
+        ]])
 
     return text, keyboard
 
@@ -856,10 +907,14 @@ async def format_transaction(tx: dict, label: str, address: str,
         if not main_mint:
             # No non-base token found — skip entirely (USDC/SOL shuffle)
             return None
+        # Fetch age+MC for all non-base tokens in this tx
+        all_non_base = {x.get("mint") for x in tok_xfers
+                        if x.get("mint") and x.get("mint") not in _BASE}
+        for mint in all_non_base:
+            if mint not in _created_cache or mint not in _mc_cache:
+                await get_token_age(mint)
         balance = 0.0
         if main_mint:
-            if main_mint not in _created_cache:
-                await get_token_age(main_mint)
             balance = await get_wallet_token_balance(address, main_mint)
         return format_swap(tx, label, address, syms, prices, balance)
 
