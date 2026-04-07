@@ -30,10 +30,10 @@ from telegram.ext import (Application, CommandHandler, ContextTypes,
 # ============================================================
 # CONFIG — keys are loaded from .env (never commit .env to git)
 # ============================================================
-HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "")
+HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "49e3657c-3b31-490d-bb92-42999d2275cb")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-POLL_CHECK_INTERVAL = 300   # How often the safety-net loop wakes up (5 min)
-POLL_STALE_AFTER    = 1800  # Only poll a wallet if no webhook activity for 30 min
+POLL_CHECK_INTERVAL = 1800  # Safety-net loop wakes up every 30 min
+POLL_STALE_AFTER    = 7200  # Only poll a wallet if no webhook activity for 2 h
 WEBHOOK_PORT  = 8080  # Port for Helius webhook receiver
 
 # ── Access control ───────────────────────────────────────────
@@ -1087,52 +1087,24 @@ async def webhook_handler(request):
     return web.Response(status=200)
 
 async def register_helius_webhook(wallets: list[str]):
-    """Create or update a Helius webhook for the tracked wallets."""
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            # List existing webhooks
-            resp = await client.get(
-                f"https://api.helius.xyz/v0/webhooks?api-key={HELIUS_API_KEY}"
-            )
-            existing = resp.json() if resp.status_code == 200 else []
+    """Deliberate no-op.
 
-            # Find our webhook
-            our_hook = None
-            for wh in existing:
-                if wh.get("webhookURL", "").endswith(f":{WEBHOOK_PORT}/helius"):
-                    our_hook = wh
-                    break
+    The bot used to auto-create/update a Helius webhook on every startup and on
+    every /add or /delete. That burns credits and can fail when the plan is
+    capped, which then kills delivery entirely. Instead, register the webhook
+    ONCE manually in the Helius dashboard:
 
-            # Get server public IP for webhook URL
-            ip_resp = await client.get("https://api.ipify.org")
-            public_ip = ip_resp.text.strip()
-            webhook_url = f"http://{public_ip}:{WEBHOOK_PORT}/helius"
+        URL:              http://<DROPLET_PUBLIC_IP>:8080/helius
+        Type:             Enhanced
+        Transaction type: Any
+        Account addresses: (paste all tracked wallets)
 
-            payload = {
-                "webhookURL": webhook_url,
-                "transactionTypes": ["Any"],
-                "accountAddresses": wallets,
-                "webhookType": "enhanced",
-            }
-
-            if our_hook:
-                # Update existing
-                hook_id = our_hook["webhookID"]
-                resp = await client.put(
-                    f"https://api.helius.xyz/v0/webhooks/{hook_id}?api-key={HELIUS_API_KEY}",
-                    json=payload,
-                )
-                print(f"[Webhook] Updated: {webhook_url} → {len(wallets)} wallets")
-            else:
-                # Create new
-                resp = await client.post(
-                    f"https://api.helius.xyz/v0/webhooks?api-key={HELIUS_API_KEY}",
-                    json=payload,
-                )
-                print(f"[Webhook] Created: {webhook_url} → {len(wallets)} wallets")
-
-    except Exception as e:
-        print(f"[Webhook] Registration failed: {e}")
+    After /add or /delete, update the account-address list in the dashboard
+    (or call this function's body manually) — but the bot will never touch
+    the webhook management API on its own.
+    """
+    print(f"[Webhook] Skipping auto-registration ({len(wallets)} wallets). "
+          f"Update the address list manually in the Helius dashboard.")
 
 async def start_webhook_server():
     """Start aiohttp server to receive Helius webhooks."""
