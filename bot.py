@@ -1086,25 +1086,111 @@ async def webhook_handler(request):
         print(f"[Webhook] Error: {e}")
     return web.Response(status=200)
 
-async def register_helius_webhook(wallets: list[str]):
-    """Deliberate no-op.
+import hashlib
 
-    The bot used to auto-create/update a Helius webhook on every startup and on
-    every /add or /delete. That burns credits and can fail when the plan is
-    capped, which then kills delivery entirely. Instead, register the webhook
-    ONCE manually in the Helius dashboard:
+WEBHOOK_META_FILE = "webhook_meta.json"
 
-        URL:              http://<DROPLET_PUBLIC_IP>:8080/helius
-        Type:             Enhanced
-        Transaction type: Any
-        Account addresses: (paste all tracked wallets)
+def _load_webhook_meta() -> dict:
+    try:
+        with open(WEBHOOK_META_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-    After /add or /delete, update the account-address list in the dashboard
-    (or call this function's body manually) — but the bot will never touch
-    the webhook management API on its own.
+def _save_webhook_meta(meta: dict) -> None:
+    try:
+        with open(WEBHOOK_META_FILE, "w") as f:
+            json.dump(meta, f)
+    except Exception as e:
+        print(f"[Webhook] meta save failed: {e}")
+
+def _addr_hash(wallets: list[str]) -> str:
+    return hashlib.sha1(",".join(sorted(wallets)).encode()).hexdigest()
+
+async def register_helius_webhook(wallets: list[str], force: bool = False):
+    """Create/update the Helius webhook — but only when something actually changed.
+
+    State is cached in webhook_meta.json:
+        {"webhook_id": "...", "addr_hash": "...", "public_ip": "..."}
+
+    Call pattern:
+    - Startup: if cached addr_hash matches current wallets AND cached webhook_id
+      exists, skip entirely (0 credits).
+    - After /add or /delete: addr_hash differs → one PUT (1 credit).
+    - Server IP change: detected via cached public_ip, triggers one update.
+
+    Helius enhanced webhooks accept up to 100,000 addresses per webhook, so
+    500 wallets fit in a single webhook with no fanout.
     """
-    print(f"[Webhook] Skipping auto-registration ({len(wallets)} wallets). "
-          f"Update the address list manually in the Helius dashboard.")
+    if not wallets:
+        print("[Webhook] No wallets to register.")
+        return
+
+    meta = _load_webhook_meta()
+    current_hash = _addr_hash(wallets)
+
+    # Fast path: nothing changed → 0 API calls
+    if (not force
+            and meta.get("webhook_id")
+            and meta.get("addr_hash") == current_hash
+            and meta.get("public_ip")):
+        print(f"[Webhook] Cached registration still valid "
+              f"({len(wallets)} wallets → {meta['webhook_id'][:8]}...). 0 credits.")
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Only look up public IP if we don't have one cached
+            public_ip = meta.get("public_ip", "")
+            if not public_ip:
+                ip_resp = await client.get("https://api.ipify.org")
+                public_ip = ip_resp.text.strip()
+
+            webhook_url = f"http://{public_ip}:{WEBHOOK_PORT}/helius"
+            payload = {
+                "webhookURL": webhook_url,
+                "transactionTypes": ["Any"],
+                "accountAddresses": wallets,
+                "webhookType": "enhanced",
+            }
+
+            hook_id = meta.get("webhook_id", "")
+            if hook_id:
+                # Update existing — 1 credit
+                resp = await client.put(
+                    f"https://api.helius.xyz/v0/webhooks/{hook_id}?api-key={HELIUS_API_KEY}",
+                    json=payload,
+                )
+                if resp.status_code == 200:
+                    print(f"[Webhook] Updated {hook_id[:8]}... → {len(wallets)} wallets")
+                elif resp.status_code in (404, 410):
+                    # Hook was deleted remotely, fall through to create
+                    print("[Webhook] Cached hook missing — recreating.")
+                    hook_id = ""
+                else:
+                    print(f"[Webhook] Update failed {resp.status_code}: {resp.text[:200]}")
+                    return
+
+            if not hook_id:
+                # Create new — 1 credit
+                resp = await client.post(
+                    f"https://api.helius.xyz/v0/webhooks?api-key={HELIUS_API_KEY}",
+                    json=payload,
+                )
+                if resp.status_code in (200, 201):
+                    hook_id = (resp.json() or {}).get("webhookID", "")
+                    print(f"[Webhook] Created {hook_id[:8]}... → {len(wallets)} wallets")
+                else:
+                    print(f"[Webhook] Create failed {resp.status_code}: {resp.text[:200]}")
+                    return
+
+            _save_webhook_meta({
+                "webhook_id": hook_id,
+                "addr_hash": current_hash,
+                "public_ip": public_ip,
+            })
+    except Exception as e:
+        print(f"[Webhook] Registration error: {e}")
 
 async def start_webhook_server():
     """Start aiohttp server to receive Helius webhooks."""
