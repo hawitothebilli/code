@@ -8,6 +8,7 @@ Setup: See SETUP.md
 """
 
 import asyncio
+import time
 import sqlite3
 import httpx
 import logging
@@ -31,7 +32,8 @@ from telegram.ext import (Application, CommandHandler, ContextTypes,
 # ============================================================
 HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-POLL_INTERVAL = 30  # Fallback polling interval (webhook handles real-time)
+POLL_CHECK_INTERVAL = 300   # How often the safety-net loop wakes up (5 min)
+POLL_STALE_AFTER    = 1800  # Only poll a wallet if no webhook activity for 30 min
 WEBHOOK_PORT  = 8080  # Port for Helius webhook receiver
 
 # ── Access control ───────────────────────────────────────────
@@ -125,6 +127,11 @@ def add_wallet(address: str, label: str) -> bool:
             (address, label)
         )
         conn.commit()
+        # Mark as "fresh" so the safety-net poller doesn't immediately hammer it
+        try:
+            _last_webhook_time[address] = time.time()
+        except Exception:
+            pass
         return True
     except sqlite3.IntegrityError:
         return False
@@ -179,6 +186,7 @@ KNOWN_TOKENS = {
 
 # In-memory caches
 _processed_sigs: set[str] = set()     # dedup: signatures already sent to Telegram
+_last_webhook_time: dict[str, float] = {}  # address -> last webhook activity epoch
 _symbol_cache: dict[str, str] = {}
 _mc_cache: dict[str, float] = {}      # mint → market cap USD
 _created_cache: dict[str, int] = {}   # mint → pair created timestamp (ms)
@@ -411,6 +419,26 @@ async def get_wallet_token_balance(wallet: str, mint: str) -> float:
     except Exception as e:
         print(f"[RPC] Balance error: {e}")
     return 0.0
+
+async def fetch_latest_signature(address: str) -> str:
+    """Cheap RPC call (1 credit) — returns the newest signature or ''."""
+    url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+    payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "getSignaturesForAddress",
+        "params": [address, {"limit": 1}],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code == 200:
+                result = (resp.json() or {}).get("result") or []
+                if result:
+                    return result[0].get("signature", "") or ""
+    except Exception as e:
+        print(f"[Helius RPC] sig check failed: {e}")
+    return ""
+
 
 async def fetch_transactions(address: str, limit: int = 10):
     """Fetch recent parsed transactions for a wallet from Helius."""
@@ -1017,6 +1045,9 @@ async def webhook_handler(request):
             if not address:
                 continue
 
+            # Mark webhook activity so the safety-net poller can skip this wallet
+            _last_webhook_time[address] = time.time()
+
             # Update cursor so polling doesn't re-send
             sig = tx.get("signature", "")
             if sig:
@@ -1124,15 +1155,45 @@ async def start_webhook_server():
 # ─────────────────────────────────────────
 
 async def track_wallets(app: Application):
-    """Background loop: polls wallets and sends Telegram alerts on new activity."""
-    print("👁  Tracker started — polling every", POLL_INTERVAL, "seconds (fallback)")
-    await asyncio.sleep(3)  # Let the bot fully start first
+    """Safety-net loop: only polls wallets that haven't received webhook activity recently.
+    Webhooks deliver real-time alerts; this catches anything Helius might drop."""
+    print(f"👁  Tracker started — safety-net check every {POLL_CHECK_INTERVAL}s "
+          f"(only stale wallets >{POLL_STALE_AFTER}s)")
+    # Seed every existing wallet as "just active" so the safety net waits a full
+    # POLL_STALE_AFTER window before its first poll. Webhooks will overwrite this
+    # naturally as activity comes in.
+    _now = time.time()
+    for _addr, _lbl, _ in get_wallets():
+        _last_webhook_time.setdefault(_addr, _now)
+    await asyncio.sleep(10)  # Let the bot + webhook fully start first
 
     while True:
         wallets = get_wallets()
+        now = time.time()
+        stale = [(a, l, s) for a, l, s in wallets
+                 if now - _last_webhook_time.get(a, 0) > POLL_STALE_AFTER]
 
-        for address, label, last_sig in wallets:
+        if stale:
+            print(f"[Tracker] Safety-net poll: {len(stale)}/{len(wallets)} stale wallet(s)")
+
+        for address, label, last_sig in stale:
             try:
+                # CHEAP check first (1 credit) — skip the 100-credit parsed call
+                # unless the newest signature actually differs from our cursor.
+                newest = await fetch_latest_signature(address)
+                if not newest:
+                    await asyncio.sleep(0.2)
+                    continue
+                if last_sig and newest == last_sig:
+                    # No new activity — don't spend 100 credits on parsed tx
+                    await asyncio.sleep(0.2)
+                    continue
+                if last_sig is None:
+                    # First time seeing this wallet: set cursor without parsing
+                    update_last_signature(address, newest)
+                    await asyncio.sleep(0.2)
+                    continue
+
                 txs = await fetch_transactions(address, limit=10)
                 if not txs:
                     await asyncio.sleep(1)
@@ -1201,7 +1262,7 @@ async def track_wallets(app: Application):
             except Exception as e:
                 print(f"[Tracker] Error on {label}: {e}")
 
-        await asyncio.sleep(POLL_INTERVAL)
+        await asyncio.sleep(POLL_CHECK_INTERVAL)
 
 
 # ─────────────────────────────────────────
@@ -1499,4 +1560,4 @@ async def main():
             await app.stop()
 
 if __name__ == "__main__":
-    asyncio.run(main())       
+    asyncio.run(main())
